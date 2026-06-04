@@ -33,9 +33,12 @@ def scrape() -> list[Listing]:
             RUN_URL,
             headers=headers,
             json={
-                "startUrls": [{"url": u} for u in SEARCH_URLS],
-                "maxItems": 100,
-                "proxyConfiguration": {"useApifyProxy": True},
+                "country": "es",
+                "operation": "rent",
+                "district": "Madrid",
+                "propertyType": "homes",
+                "maxItems": 150,
+                "startUrl": [{"url": u} for u in SEARCH_URLS],
             },
             timeout=30,
         )

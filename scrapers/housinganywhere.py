@@ -48,6 +48,12 @@ def scrape() -> list[Listing]:
                     log.info("HousingAnywhere: %d from __NEXT_DATA__", len(listings))
 
             if not listings:
+                # Debug: log page title and a sample of body HTML
+                title = page.title()
+                sample = page.evaluate("() => document.body.innerHTML.slice(0, 3000)")
+                log.info("HousingAnywhere page title: %s", title)
+                log.info("HousingAnywhere HTML sample: %s", sample)
+
                 # Fallback: extract from visible DOM
                 items_json = page.evaluate("""
                     () => {

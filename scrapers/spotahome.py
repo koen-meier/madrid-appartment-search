@@ -46,6 +46,11 @@ def scrape() -> list[Listing]:
                     log.info("Spotahome: %d from __NEXT_DATA__", len(listings))
 
             if not listings:
+                title = page.title()
+                sample = page.evaluate("() => document.body.innerHTML.slice(0, 3000)")
+                log.info("Spotahome page title: %s", title)
+                log.info("Spotahome HTML sample: %s", sample)
+
                 items_json = page.evaluate("""
                     () => {
                         const cards = document.querySelectorAll('[class*="home-card"], [class*="HomeCard"], [data-testid*="home"]');
