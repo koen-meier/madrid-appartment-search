@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Madrid Apartment Search</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f3f4f6; color: #111; }
+
+    header {
+      background: #fff; border-bottom: 1px solid #e5e7eb;
+      padding: 16px 24px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+      position: sticky; top: 0; z-index: 10;
+    }
+    header h1 { font-size: 18px; font-weight: 700; white-space: nowrap; }
+    .stats { font-size: 13px; color: #6b7280; }
+
+    .filters {
+      display: flex; gap: 8px; flex-wrap: wrap; margin-left: auto; align-items: center;
+    }
+    .filters select, .filters input {
+      border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 10px;
+      font-size: 13px; background: #fff; cursor: pointer;
+    }
+    .filters label { font-size: 13px; color: #374151; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+
+    main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 16px;
+    }
+
+    .card {
+      background: #fff; border-radius: 10px; overflow: hidden;
+      border: 1px solid #e5e7eb;
+      transition: box-shadow .15s;
+      display: flex; flex-direction: column;
+    }
+    .card:hover { box-shadow: 0 4px 16px rgba(0,0,0,.08); }
+    .card.rated-bad { opacity: .45; }
+
+    .card-img {
+      width: 100%; height: 180px; object-fit: cover; display: block;
+      background: #f3f4f6;
+    }
+    .card-img-placeholder {
+      width: 100%; height: 180px; background: #e5e7eb;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 36px; color: #9ca3af;
+    }
+
+    .card-body { padding: 12px 14px; flex: 1; display: flex; flex-direction: column; gap: 4px; }
+
+    .card-top { display: flex; justify-content: space-between; align-items: flex-start; }
+    .source-badge {
+      font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 99px;
+      text-transform: uppercase; letter-spacing: .04em; white-space: nowrap;
+    }
+    .source-housinganywhere { background: #ede9fe; color: #4f46e5; }
+    .source-idealista       { background: #fee2e2; color: #dc2626; }
+    .source-spotahome       { background: #ffedd5; color: #ea580c; }
+    .source-fotocasa        { background: #dcfce7; color: #16a34a; }
+
+    .price { font-size: 20px; font-weight: 700; }
+    .price span { font-size: 13px; font-weight: 400; color: #6b7280; }
+
+    .card-title { font-size: 14px; font-weight: 600; line-height: 1.3; }
+    .card-meta { font-size: 12px; color: #6b7280; }
+
+    .card-actions {
+      display: flex; gap: 6px; padding: 10px 14px 14px;
+      border-top: 1px solid #f3f4f6; margin-top: auto;
+      flex-wrap: wrap;
+    }
+    .btn {
+      flex: 1; padding: 7px 10px; border-radius: 6px; border: none;
+      font-size: 13px; cursor: pointer; font-weight: 500; transition: opacity .1s;
+    }
+    .btn:hover { opacity: .85; }
+    .btn-good  { background: #dcfce7; color: #15803d; }
+    .btn-maybe { background: #fef9c3; color: #854d0e; }
+    .btn-bad   { background: #fee2e2; color: #b91c1c; }
+    .btn-link  { background: #f3f4f6; color: #374151; text-decoration: none; text-align: center; }
+    .btn.active-good  { background: #15803d; color: #fff; }
+    .btn.active-maybe { background: #854d0e; color: #fff; }
+    .btn.active-bad   { background: #b91c1c; color: #fff; }
+
+    .comment-row { padding: 0 14px 12px; display: none; }
+    .comment-row.open { display: flex; gap: 6px; }
+    .comment-row input {
+      flex: 1; border: 1px solid #d1d5db; border-radius: 6px; padding: 6px 10px;
+      font-size: 13px;
+    }
+    .comment-row button {
+      background: #111; color: #fff; border: none; border-radius: 6px;
+      padding: 6px 12px; font-size: 13px; cursor: pointer;
+    }
+
+    .rating-note {
+      font-size: 11px; color: #6b7280; padding: 0 14px 10px;
+      font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+
+    .empty { text-align: center; color: #9ca3af; padding: 64px 0; font-size: 15px; }
+    .loading { text-align: center; padding: 64px 0; color: #6b7280; }
+
+    .new-badge {
+      font-size: 10px; font-weight: 700; background: #fbbf24; color: #78350f;
+      padding: 2px 6px; border-radius: 99px; margin-left: 4px;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>🏠 Madrid Apartments <span id="new-count" class="new-badge" style="display:none"></span></h1>
+  <div class="stats" id="stats">Loading…</div>
+  <div class="filters">
+    <select id="filter-source">
+      <option value="">All sources</option>
+      <option value="housinganywhere">HousingAnywhere</option>
+      <option value="idealista">Idealista</option>
+      <option value="spotahome">Spotahome</option>
+      <option value="fotocasa">Fotocasa</option>
+    </select>
+    <select id="filter-neighborhood">
+      <option value="">All neighborhoods</option>
+    </select>
+    <select id="filter-rating">
+      <option value="">All ratings</option>
+      <option value="unrated">Unrated</option>
+      <option value="good">👍 Good</option>
+      <option value="maybe">🤔 Maybe</option>
+      <option value="bad">👎 Bad</option>
+    </select>
+    <select id="filter-price">
+      <option value="">Any price</option>
+      <option value="600">≤ €600</option>
+      <option value="700">≤ €700</option>
+      <option value="800">≤ €800</option>
+      <option value="900">≤ €900</option>
+      <option value="1000">≤ €1000</option>
+    </select>
+    <select id="sort">
+      <option value="newest">Newest first</option>
+      <option value="price_asc">Price ↑</option>
+      <option value="price_desc">Price ↓</option>
+    </select>
+    <label><input type="checkbox" id="hide-bad"> Hide thumbs down</label>
+  </div>
+</header>
+
+<main>
+  <div class="loading" id="loading">Loading listings…</div>
+  <div class="grid" id="grid" style="display:none"></div>
+  <div class="empty" id="empty" style="display:none">No listings match your filters.</div>
+</main>
+
+<script>
+// ── Config ─────────────────────────────────────────────────────────────────
+const SUPABASE_URL = "https://dunuilfxwivchtictnir.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR1bnVpbGZ4d2l2Y2h0aWN0bmlyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA1MzI0NjgsImV4cCI6MjA5NjEwODQ2OH0.d5s3snjBVqetDkYNT6m1j_Q90-x5DukyK-fHQrppx50";
+// ───────────────────────────────────────────────────────────────────────────
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+let allListings = [];
+let ratingsMap = {};  // listing_id → { rating, comment }
+
+async function load() {
+  // Fetch all listings
+  const { data: listings, error } = await sb
+    .from("listings")
+    .select("*")
+    .order("first_seen_at", { ascending: false });
+
+  if (error) { document.getElementById("loading").textContent = "Error: " + error.message; return; }
+
+  allListings = listings || [];
+
+  // Fetch all ratings
+  const { data: ratings } = await sb.from("ratings").select("*").order("created_at", { ascending: false });
+  ratingsMap = {};
+  for (const r of (ratings || [])) {
+    if (!ratingsMap[r.listing_id]) ratingsMap[r.listing_id] = r;
+  }
+
+  populateNeighborhoodFilter();
+  render();
+
+  document.getElementById("loading").style.display = "none";
+  document.getElementById("grid").style.display = "";
+}
+
+function populateNeighborhoodFilter() {
+  const seen = new Set();
+  const sel = document.getElementById("filter-neighborhood");
+  for (const l of allListings) {
+    const n = l.neighborhood;
+    if (n && !seen.has(n)) {
+      seen.add(n);
+      const opt = document.createElement("option");
+      opt.value = n; opt.textContent = n;
+      sel.appendChild(opt);
+    }
+  }
+}
+
+function applyFilters() {
+  const source = document.getElementById("filter-source").value;
+  const neighborhood = document.getElementById("filter-neighborhood").value;
+  const ratingFilter = document.getElementById("filter-rating").value;
+  const maxPrice = parseInt(document.getElementById("filter-price").value) || Infinity;
+  const hideBad = document.getElementById("hide-bad").checked;
+  const sort = document.getElementById("sort").value;
+
+  let items = allListings.filter(l => {
+    if (source && l.source !== source) return false;
+    if (neighborhood && l.neighborhood !== neighborhood) return false;
+    if (l.price_eur > maxPrice) return false;
+
+    const r = ratingsMap[l.id];
+    if (hideBad && r?.rating === "bad") return false;
+
+    if (ratingFilter === "unrated" && r) return false;
+    if (ratingFilter === "good"    && r?.rating !== "good") return false;
+    if (ratingFilter === "maybe"   && r?.rating !== "maybe") return false;
+    if (ratingFilter === "bad"     && r?.rating !== "bad") return false;
+
+    return true;
+  });
+
+  if (sort === "price_asc")  items.sort((a, b) => a.price_eur - b.price_eur);
+  if (sort === "price_desc") items.sort((a, b) => b.price_eur - a.price_eur);
+
+  return items;
+}
+
+function render() {
+  const items = applyFilters();
+  const grid = document.getElementById("grid");
+  const empty = document.getElementById("empty");
+
+  // Stats
+  const unrated = allListings.filter(l => !ratingsMap[l.id]).length;
+  const newCount = allListings.filter(l => {
+    const age = Date.now() - new Date(l.first_seen_at);
+    return age < 24 * 60 * 60 * 1000;
+  }).length;
+
+  document.getElementById("stats").textContent =
+    `${allListings.length} total · ${unrated} unrated`;
+
+  const badge = document.getElementById("new-count");
+  if (newCount > 0) { badge.textContent = newCount + " new"; badge.style.display = ""; }
+  else badge.style.display = "none";
+
+  if (items.length === 0) {
+    grid.style.display = "none"; empty.style.display = "";
+    return;
+  }
+  grid.style.display = ""; empty.style.display = "none";
+
+  grid.innerHTML = "";
+  for (const l of items) {
+    grid.appendChild(buildCard(l));
+  }
+}
+
+function buildCard(l) {
+  const r = ratingsMap[l.id];
+  const card = document.createElement("div");
+  card.className = "card" + (r?.rating === "bad" ? " rated-bad" : "");
+  card.dataset.id = l.id;
+
+  const img = l.images?.[0];
+  const imgHtml = img
+    ? `<img class="card-img" src="${esc(img)}" loading="lazy" onerror="this.style.display='none'">`
+    : `<div class="card-img-placeholder">🏠</div>`;
+
+  const area = l.area_m2 ? ` · ${l.area_m2} m²` : "";
+  const dateStr = new Date(l.first_seen_at).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
+  const isNew = Date.now() - new Date(l.first_seen_at) < 24 * 60 * 60 * 1000;
+
+  card.innerHTML = `
+    ${imgHtml}
+    <div class="card-body">
+      <div class="card-top">
+        <span class="source-badge source-${esc(l.source)}">${esc(l.source)}${isNew ? ' 🆕' : ''}</span>
+        <div class="price">€${l.price_eur}<span>/mo</span></div>
+      </div>
+      <div class="card-title">${esc(l.title || "Apartment")}</div>
+      <div class="card-meta">${esc(l.neighborhood || "")}${area} · seen ${dateStr}</div>
+    </div>
+    ${r?.comment ? `<div class="rating-note" title="${esc(r.comment)}">💬 ${esc(r.comment)}</div>` : ""}
+    <div class="card-actions">
+      <button class="btn btn-good ${r?.rating === 'good' ? 'active-good' : ''}" onclick="rate('${l.id}','good',this)">👍</button>
+      <button class="btn btn-maybe ${r?.rating === 'maybe' ? 'active-maybe' : ''}" onclick="rate('${l.id}','maybe',this)">🤔</button>
+      <button class="btn btn-bad ${r?.rating === 'bad' ? 'active-bad' : ''}" onclick="rate('${l.id}','bad',this)">👎</button>
+      <a class="btn btn-link" href="${esc(l.url)}" target="_blank" rel="noopener">View →</a>
+    </div>
+    <div class="comment-row" id="comment-${l.id}">
+      <input type="text" placeholder="Add a note (optional)…" value="${esc(r?.comment || '')}">
+      <button onclick="saveComment('${l.id}')">Save</button>
+    </div>`;
+
+  return card;
+}
+
+async function rate(id, rating, btn) {
+  // Optimistic UI
+  const card = btn.closest(".card");
+  card.querySelectorAll(".btn-good,.btn-maybe,.btn-bad").forEach(b => {
+    b.classList.remove("active-good","active-maybe","active-bad");
+  });
+  btn.classList.add(`active-${rating}`);
+  card.classList.toggle("rated-bad", rating === "bad");
+
+  // Show comment box
+  const commentRow = document.getElementById(`comment-${id}`);
+  commentRow.classList.add("open");
+
+  // Save to DB
+  const { data } = await sb.from("ratings").insert({ listing_id: id, rating }).select().single();
+  if (data) {
+    ratingsMap[id] = data;
+    render();
+  }
+}
+
+async function saveComment(id) {
+  const row = document.getElementById(`comment-${id}`);
+  const text = row.querySelector("input").value.trim();
+  if (!text) return;
+
+  await sb.from("ratings").insert({ listing_id: id, comment: text });
+  if (ratingsMap[id]) ratingsMap[id].comment = text;
+  render();
+}
+
+function esc(s) {
+  if (!s) return "";
+  return String(s)
+    .replace(/&/g,"&amp;")
+    .replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;")
+    .replace(/"/g,"&quot;");
+}
+
+// Wire up filters
+["filter-source","filter-neighborhood","filter-rating","filter-price","sort","hide-bad"]
+  .forEach(id => document.getElementById(id).addEventListener("change", render));
+
+load();
+</script>
+</body>
+</html>
