@@ -1,110 +1,151 @@
 """
-Spotahome scraper — reads __NEXT_DATA__ JSON embedded in the search page.
-Specialises in mid-term furnished rentals (1–12 months).
+Spotahome scraper — parses __NEXT_DATA__ + HTML cards from search page.
 """
 import json
 import logging
 import re
+from bs4 import BeautifulSoup
 from .base import Listing, make_client
 
 log = logging.getLogger(__name__)
 
-SEARCH_URL = (
-    "https://www.spotahome.com/en/for-rent/madrid"
-    "?propertyTypes[]=apartment&propertyTypes[]=studio"
-    "&maxPrice=1000"
-    "&minMonths=4"
-    "&maxMonths=6"
-    "&amenities[]=furnished"
-)
+SEARCH_URLS = [
+    "https://www.spotahome.com/s/madrid/for-rent:apartments",
+    "https://www.spotahome.com/s/madrid",
+]
 
 
 def scrape() -> list[Listing]:
     listings = []
     with make_client() as client:
-        try:
-            resp = client.get(SEARCH_URL)
-            resp.raise_for_status()
-            html = resp.text
-        except Exception as exc:
-            log.error("Spotahome request failed: %s", exc)
-            return []
+        for url in SEARCH_URLS:
+            try:
+                resp = client.get(url)
+                resp.raise_for_status()
+                found = _parse_page(resp.text)
+                if found:
+                    listings.extend(found)
+                    break
+            except Exception as exc:
+                log.warning("Spotahome fetch failed (%s): %s", url, exc)
 
-    # Extract __NEXT_DATA__ JSON
+    filtered = [l for l in listings if l.price_eur and l.price_eur <= 1000]
+    log.info("Spotahome: %d listings", len(filtered))
+    return filtered
+
+
+def _parse_page(html: str) -> list[Listing]:
+    # Try __NEXT_DATA__
     match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-    if not match:
-        log.warning("Spotahome: __NEXT_DATA__ not found — site may have changed")
-        return []
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            items = _deep_find_listings(data)
+            if items:
+                log.info("Spotahome: found %d items in __NEXT_DATA__", len(items))
+                return [l for item in items if (l := _parse_item(item))]
+        except Exception as exc:
+            log.warning("Spotahome __NEXT_DATA__ error: %s", exc)
 
-    try:
-        data = json.loads(match.group(1))
-    except json.JSONDecodeError as exc:
-        log.error("Spotahome JSON parse error: %s", exc)
-        return []
-
-    # Navigate into the nested structure (structure may vary)
-    props = data.get("props", {}).get("pageProps", {})
-    items = (
-        props.get("properties")
-        or props.get("listings")
-        or props.get("homes")
-        or _deep_find_listings(props)
-        or []
-    )
-
-    for item in items:
-        listing = _parse(item)
-        if listing:
-            listings.append(listing)
-
-    log.info("Spotahome: %d listings", len(listings))
-    return listings
+    # Fallback: HTML cards
+    return _parse_html_cards(html)
 
 
 def _deep_find_listings(obj, depth=0) -> list:
-    """Recursively look for a list of dicts that look like property listings."""
-    if depth > 5:
+    if depth > 6:
         return []
-    if isinstance(obj, list) and obj and isinstance(obj[0], dict) and "price" in obj[0]:
-        return obj
+    if isinstance(obj, list) and len(obj) > 2 and isinstance(obj[0], dict):
+        if any(k in obj[0] for k in ("price", "priceInfo", "id", "homeId")):
+            return obj
     if isinstance(obj, dict):
         for v in obj.values():
-            result = _deep_find_listings(v, depth + 1)
-            if result:
-                return result
+            r = _deep_find_listings(v, depth + 1)
+            if r:
+                return r
     return []
 
 
-def _parse(item: dict) -> Listing | None:
+def _parse_html_cards(html: str) -> list[Listing]:
+    soup = BeautifulSoup(html, "lxml")
+    listings = []
+
+    for card in soup.select("[class*='home-card'], [class*='HomeCard'], [class*='listing'], article"):
+        try:
+            link = card.select_one("a[href*='/flat'], a[href*='/home'], a[href*='/apartment']")
+            if not link:
+                link = card.select_one("a[href]")
+            if not link:
+                continue
+
+            href = link.get("href", "")
+            url = href if href.startswith("http") else f"https://www.spotahome.com{href}"
+            uid = href.rstrip("/").split("/")[-1].split("?")[0]
+
+            price_el = card.select_one("[class*='price'], [class*='Price']")
+            if not price_el:
+                continue
+            price_nums = re.findall(r"\d+", price_el.get_text().replace(".", "").replace(",", ""))
+            if not price_nums:
+                continue
+            price = int(price_nums[0])
+            if price <= 0 or price > 1100:
+                continue
+
+            title_el = card.select_one("h2, h3, [class*='title'], [class*='Title']")
+            title = title_el.get_text(strip=True) if title_el else f"Apartment {uid}"
+
+            location_el = card.select_one("[class*='location'], [class*='Location'], [class*='zone'], [class*='area']")
+            neighborhood = location_el.get_text(strip=True) if location_el else "Madrid"
+
+            images = []
+            for img in card.select("img"):
+                src = img.get("src") or img.get("data-src") or ""
+                if src and "spotahome" in src:
+                    images.append(src)
+
+            listings.append(Listing(
+                source="spotahome",
+                external_id=uid or url,
+                url=url,
+                title=title,
+                price_eur=price,
+                neighborhood=neighborhood,
+                furnished=True,
+                images=images[:5],
+                raw_data={"url": url},
+            ))
+        except Exception as exc:
+            log.debug("Spotahome card parse error: %s", exc)
+
+    return listings
+
+
+def _parse_item(item: dict) -> Listing | None:
     try:
-        price_info = item.get("price") or item.get("pricing") or {}
+        price_info = item.get("price") or item.get("priceInfo") or item.get("pricing") or {}
         if isinstance(price_info, dict):
-            price = int(price_info.get("amount") or price_info.get("value") or 0)
+            price = int(price_info.get("amount") or price_info.get("value") or price_info.get("price") or 0)
         else:
             price = int(price_info)
-        if price <= 0 or price > 1000:
+        if price <= 0 or price > 1100:
             return None
 
-        uid = str(item.get("id") or item.get("homeId") or "")
+        uid = str(item.get("id") or item.get("homeId") or item.get("slug") or "")
         slug = item.get("slug") or uid
         url = f"https://www.spotahome.com/en/flat-and-house-for-rent/{slug}" if slug else ""
 
+        location = item.get("location") or {}
         neighborhood = (
-            item.get("neighborhood")
-            or item.get("area")
-            or item.get("zone")
-            or item.get("location", {}).get("neighborhood")
+            item.get("neighborhood") or item.get("area") or item.get("zone")
+            or (location.get("neighborhood") if isinstance(location, dict) else None)
             or "Madrid"
         )
 
         images = []
         for img in item.get("images") or item.get("photos") or item.get("media") or []:
-            if isinstance(img, str):
-                images.append(img)
-            elif isinstance(img, dict):
-                images.append(
-                    img.get("url") or img.get("src") or img.get("originalUrl") or ""
-                )
+            src = img.get("url") or img.get("src") or "" if isinstance(img, dict) else img
+            if src:
+                images.append(src)
 
         return Listing(
             source="spotahome",
@@ -116,11 +157,11 @@ def _parse(item: dict) -> Listing | None:
             area_m2=item.get("squareMeters") or item.get("area") or item.get("size"),
             furnished=True,
             description=item.get("description") or "",
-            images=[i for i in images if i],
-            lat=(item.get("location") or {}).get("lat") or item.get("lat"),
-            lng=(item.get("location") or {}).get("lng") or item.get("lng"),
+            images=images[:10],
+            lat=(location.get("lat") if isinstance(location, dict) else None) or item.get("lat"),
+            lng=(location.get("lng") if isinstance(location, dict) else None) or item.get("lng"),
             raw_data=item,
         )
     except Exception as exc:
-        log.warning("Spotahome parse error: %s | item: %s", exc, item)
+        log.warning("Spotahome item parse error: %s", exc)
         return None
