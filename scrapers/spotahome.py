@@ -1,61 +1,88 @@
 """
-Spotahome scraper — parses __NEXT_DATA__ + HTML cards from search page.
+Spotahome scraper — Playwright for JS rendering, extracts __NEXT_DATA__ or DOM.
 """
 import json
 import logging
 import re
-from bs4 import BeautifulSoup
-from .base import Listing, make_client
+from .base import Listing
 
 log = logging.getLogger(__name__)
 
-SEARCH_URLS = [
-    "https://www.spotahome.com/s/madrid/for-rent:apartments",
-    "https://www.spotahome.com/s/madrid",
-]
+SEARCH_URL = "https://www.spotahome.com/s/madrid/for-rent:apartments"
 
 
 def scrape() -> list[Listing]:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.error("playwright not installed")
+        return []
+
     listings = []
-    with make_client() as client:
-        for url in SEARCH_URLS:
-            try:
-                resp = client.get(url)
-                resp.raise_for_status()
-                found = _parse_page(resp.text)
-                if found:
-                    listings.extend(found)
-                    break
-            except Exception as exc:
-                log.warning("Spotahome fetch failed (%s): %s", url, exc)
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        )
+        try:
+            page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
+
+            next_data = page.evaluate("""
+                () => {
+                    const el = document.getElementById('__NEXT_DATA__');
+                    return el ? el.textContent : null;
+                }
+            """)
+
+            if next_data:
+                data = json.loads(next_data)
+                items = _deep_find_listings(data)
+                if items:
+                    listings = [l for item in items if (l := _parse_item(item))]
+                    log.info("Spotahome: %d from __NEXT_DATA__", len(listings))
+
+            if not listings:
+                items_json = page.evaluate("""
+                    () => {
+                        const cards = document.querySelectorAll('[class*="home-card"], [class*="HomeCard"], [data-testid*="home"]');
+                        return Array.from(cards).map(card => {
+                            const link = card.querySelector('a[href]');
+                            const price = card.querySelector('[class*="price"], [class*="Price"]');
+                            const title = card.querySelector('h2, h3, [class*="title"]');
+                            const loc = card.querySelector('[class*="zone"], [class*="area"], [class*="location"]');
+                            const img = card.querySelector('img');
+                            return {
+                                url: link ? link.href : '',
+                                priceText: price ? price.innerText : '',
+                                title: title ? title.innerText : '',
+                                neighborhood: loc ? loc.innerText : 'Madrid',
+                                img: img ? (img.src || img.dataset.src || '') : '',
+                            };
+                        });
+                    }
+                """)
+                listings = [l for item in (items_json or []) if (l := _parse_dom_item(item))]
+                log.info("Spotahome: %d from DOM", len(listings))
+
+        except Exception as exc:
+            log.error("Spotahome scrape error: %s", exc)
+        finally:
+            browser.close()
 
     filtered = [l for l in listings if l.price_eur and l.price_eur <= 1000]
-    log.info("Spotahome: %d listings", len(filtered))
+    log.info("Spotahome: %d listings after filter", len(filtered))
     return filtered
 
 
-def _parse_page(html: str) -> list[Listing]:
-    # Try __NEXT_DATA__
-    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(1))
-            items = _deep_find_listings(data)
-            if items:
-                log.info("Spotahome: found %d items in __NEXT_DATA__", len(items))
-                return [l for item in items if (l := _parse_item(item))]
-        except Exception as exc:
-            log.warning("Spotahome __NEXT_DATA__ error: %s", exc)
-
-    # Fallback: HTML cards
-    return _parse_html_cards(html)
-
-
 def _deep_find_listings(obj, depth=0) -> list:
-    if depth > 6:
+    if depth > 7:
         return []
-    if isinstance(obj, list) and len(obj) > 2 and isinstance(obj[0], dict):
-        if any(k in obj[0] for k in ("price", "priceInfo", "id", "homeId")):
+    if isinstance(obj, list) and len(obj) > 1 and isinstance(obj[0], dict):
+        if any(k in obj[0] for k in ("price", "priceInfo", "id", "homeId", "slug")):
             return obj
     if isinstance(obj, dict):
         for v in obj.values():
@@ -65,82 +92,48 @@ def _deep_find_listings(obj, depth=0) -> list:
     return []
 
 
-def _parse_html_cards(html: str) -> list[Listing]:
-    soup = BeautifulSoup(html, "lxml")
-    listings = []
-
-    for card in soup.select("[class*='home-card'], [class*='HomeCard'], [class*='listing'], article"):
-        try:
-            link = card.select_one("a[href*='/flat'], a[href*='/home'], a[href*='/apartment']")
-            if not link:
-                link = card.select_one("a[href]")
-            if not link:
-                continue
-
-            href = link.get("href", "")
-            url = href if href.startswith("http") else f"https://www.spotahome.com{href}"
-            uid = href.rstrip("/").split("/")[-1].split("?")[0]
-
-            price_el = card.select_one("[class*='price'], [class*='Price']")
-            if not price_el:
-                continue
-            price_nums = re.findall(r"\d+", price_el.get_text().replace(".", "").replace(",", ""))
-            if not price_nums:
-                continue
-            price = int(price_nums[0])
-            if price <= 0 or price > 1100:
-                continue
-
-            title_el = card.select_one("h2, h3, [class*='title'], [class*='Title']")
-            title = title_el.get_text(strip=True) if title_el else f"Apartment {uid}"
-
-            location_el = card.select_one("[class*='location'], [class*='Location'], [class*='zone'], [class*='area']")
-            neighborhood = location_el.get_text(strip=True) if location_el else "Madrid"
-
-            images = []
-            for img in card.select("img"):
-                src = img.get("src") or img.get("data-src") or ""
-                if src and "spotahome" in src:
-                    images.append(src)
-
-            listings.append(Listing(
-                source="spotahome",
-                external_id=uid or url,
-                url=url,
-                title=title,
-                price_eur=price,
-                neighborhood=neighborhood,
-                furnished=True,
-                images=images[:5],
-                raw_data={"url": url},
-            ))
-        except Exception as exc:
-            log.debug("Spotahome card parse error: %s", exc)
-
-    return listings
+def _parse_dom_item(item: dict) -> Listing | None:
+    try:
+        url = item.get("url", "")
+        uid = url.rstrip("/").split("/")[-1].split("?")[0]
+        nums = re.findall(r"\d+", item.get("priceText", "").replace(".", "").replace(",", ""))
+        if not nums:
+            return None
+        price = int(nums[0])
+        if price <= 0 or price > 1100:
+            return None
+        return Listing(
+            source="spotahome",
+            external_id=uid or url,
+            url=url,
+            title=item.get("title") or f"Apartment {uid}",
+            price_eur=price,
+            neighborhood=item.get("neighborhood") or "Madrid",
+            furnished=True,
+            images=[item["img"]] if item.get("img") else [],
+            raw_data=item,
+        )
+    except Exception as exc:
+        log.debug("Spotahome DOM parse error: %s", exc)
+        return None
 
 
 def _parse_item(item: dict) -> Listing | None:
     try:
         price_info = item.get("price") or item.get("priceInfo") or item.get("pricing") or {}
-        if isinstance(price_info, dict):
-            price = int(price_info.get("amount") or price_info.get("value") or price_info.get("price") or 0)
-        else:
-            price = int(price_info)
+        price = int(price_info.get("amount") or price_info.get("value") or price_info.get("price") or 0) if isinstance(price_info, dict) else int(price_info or 0)
         if price <= 0 or price > 1100:
             return None
 
         uid = str(item.get("id") or item.get("homeId") or item.get("slug") or "")
         slug = item.get("slug") or uid
         url = f"https://www.spotahome.com/en/flat-and-house-for-rent/{slug}" if slug else ""
-
         location = item.get("location") or {}
         neighborhood = (
             item.get("neighborhood") or item.get("area") or item.get("zone")
             or (location.get("neighborhood") if isinstance(location, dict) else None)
             or "Madrid"
         )
-
         images = []
         for img in item.get("images") or item.get("photos") or item.get("media") or []:
             src = img.get("url") or img.get("src") or "" if isinstance(img, dict) else img

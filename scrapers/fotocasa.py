@@ -1,107 +1,152 @@
 """
-Fotocasa scraper — reads JSON-LD + embedded page data from search results.
-Major Spanish real estate portal.
+Fotocasa scraper — Playwright to bypass 405/anti-bot, extract __INITIAL_PROPS__ or DOM.
 """
 import json
 import logging
 import re
-from .base import Listing, make_client
+from .base import Listing
 
 log = logging.getLogger(__name__)
 
-# Alquiler temporal (mid-term) furnished apartments in Madrid under €1000
 SEARCH_URL = (
     "https://www.fotocasa.es/es/alquiler/viviendas/madrid-capital/todas-las-zonas/l"
-    "?maxPrice=1000"
-    "&furnished=1"
-)
-
-SEARCH_API_URL = (
-    "https://api.fotocasa.es/v2/propertysearch/search"
-    "?operation=rent&propertyType=homes&locationIds=724,14,28,28079,0,1,300"
-    "&maxPrice=1000&furnished=1&pageSize=100&page={page}&culture=en-ES"
+    "?maxPrice=1000&furnished=1"
 )
 
 
 def scrape() -> list[Listing]:
-    listings = []
-    with make_client() as client:
-        page = 1
-        while True:
-            url = SEARCH_API_URL.format(page=page)
-            try:
-                resp = client.get(url)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception:
-                # Fall back to HTML scraping
-                data = _scrape_html(client)
-                listings.extend([l for item in (data or []) if (l := _parse(item))])
-                break
-
-            items = (
-                data.get("realEstates")
-                or data.get("listings")
-                or data.get("items")
-                or []
-            )
-            if not items:
-                break
-
-            for item in items:
-                listing = _parse(item)
-                if listing:
-                    listings.append(listing)
-
-            total = data.get("totalResults") or data.get("total") or 0
-            if page * 100 >= total:
-                break
-            page += 1
-
-    log.info("Fotocasa: %d listings", len(listings))
-    return listings
-
-
-def _scrape_html(client) -> list[dict]:
-    """Fallback: extract embedded JSON from HTML page."""
     try:
-        resp = client.get(SEARCH_URL)
-        resp.raise_for_status()
-        html = resp.text
-    except Exception as exc:
-        log.error("Fotocasa HTML request failed: %s", exc)
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.error("playwright not installed")
         return []
 
-    # Try window.__INITIAL_PROPS__ or similar
-    for pattern in [
-        r'window\.__INITIAL_PROPS__\s*=\s*({.*?});\s*</script>',
-        r'window\.__SERVER_PROPS__\s*=\s*({.*?});\s*</script>',
-        r'"realEstates"\s*:\s*(\[.*?\])',
-    ]:
-        match = re.search(pattern, html, re.DOTALL)
-        if match:
+    listings = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        )
+        try:
+            page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
+
+            # Accept cookie banner if present
             try:
-                obj = json.loads(match.group(1))
-                if isinstance(obj, list):
-                    return obj
-                items = obj.get("realEstates") or obj.get("listings") or []
-                if items:
-                    return items
+                page.click("button:has-text('Aceptar'), button:has-text('Accept')", timeout=3000)
             except Exception:
-                continue
+                pass
 
-    log.warning("Fotocasa: could not extract listings from HTML")
-    return []
+            # Try to extract embedded JSON
+            props = page.evaluate("""
+                () => {
+                    for (const key of ['__INITIAL_PROPS__', '__SERVER_PROPS__', '__NUXT__']) {
+                        if (window[key]) return JSON.stringify(window[key]);
+                    }
+                    const scripts = document.querySelectorAll('script:not([src])');
+                    for (const s of scripts) {
+                        if (s.textContent.includes('"realEstates"')) return s.textContent;
+                    }
+                    return null;
+                }
+            """)
+
+            if props:
+                try:
+                    data = json.loads(props)
+                    items = (
+                        data.get("realEstates")
+                        or data.get("listings")
+                        or _deep_find(data, "realEstates")
+                        or []
+                    )
+                    listings = [l for item in items if (l := _parse_item(item))]
+                    log.info("Fotocasa: %d from page data", len(listings))
+                except Exception as exc:
+                    log.warning("Fotocasa props parse error: %s", exc)
+
+            if not listings:
+                items_json = page.evaluate("""
+                    () => {
+                        const cards = document.querySelectorAll('[class*="re-CardPackMinimal"], [class*="CardPackPremium"], article');
+                        return Array.from(cards).slice(0, 80).map(card => {
+                            const link = card.querySelector('a[href]');
+                            const price = card.querySelector('[class*="re-CardPrice"], [class*="price"]');
+                            const title = card.querySelector('h2, h3, [class*="title"]');
+                            const loc = card.querySelector('[class*="CardLocation"], [class*="location"]');
+                            const img = card.querySelector('img');
+                            return {
+                                url: link ? link.href : '',
+                                priceText: price ? price.innerText : '',
+                                title: title ? title.innerText : '',
+                                neighborhood: loc ? loc.innerText : 'Madrid',
+                                img: img ? (img.src || img.dataset.src || '') : '',
+                            };
+                        }).filter(x => x.url && x.priceText);
+                    }
+                """)
+                listings = [l for item in (items_json or []) if (l := _parse_dom_item(item))]
+                log.info("Fotocasa: %d from DOM", len(listings))
+
+        except Exception as exc:
+            log.error("Fotocasa scrape error: %s", exc)
+        finally:
+            browser.close()
+
+    filtered = [l for l in listings if l.price_eur and l.price_eur <= 1000]
+    log.info("Fotocasa: %d listings after filter", len(filtered))
+    return filtered
 
 
-def _parse(item: dict) -> Listing | None:
+def _deep_find(obj, key, depth=0):
+    if depth > 5:
+        return None
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            r = _deep_find(v, key, depth + 1)
+            if r:
+                return r
+    return None
+
+
+def _parse_dom_item(item: dict) -> Listing | None:
+    try:
+        url = item.get("url", "")
+        if url and not url.startswith("http"):
+            url = "https://www.fotocasa.es" + url
+        uid = url.rstrip("/").split("/")[-1].split("?")[0]
+        nums = re.findall(r"\d+", item.get("priceText", "").replace(".", "").replace(",", ""))
+        if not nums:
+            return None
+        price = int(nums[0])
+        if price <= 0 or price > 1100:
+            return None
+        return Listing(
+            source="fotocasa",
+            external_id=uid or url,
+            url=url,
+            title=item.get("title") or f"Apartment {uid}",
+            price_eur=price,
+            neighborhood=item.get("neighborhood") or "Madrid",
+            furnished=True,
+            images=[item["img"]] if item.get("img") else [],
+            raw_data=item,
+        )
+    except Exception as exc:
+        log.debug("Fotocasa DOM parse error: %s", exc)
+        return None
+
+
+def _parse_item(item: dict) -> Listing | None:
     try:
         price_info = item.get("priceInfo") or item.get("price") or {}
-        if isinstance(price_info, dict):
-            price = int(price_info.get("price") or price_info.get("amount") or 0)
-        else:
-            price = int(price_info)
-        if price <= 0 or price > 1000:
+        price = int(price_info.get("price") or price_info.get("amount") or 0) if isinstance(price_info, dict) else int(price_info or 0)
+        if price <= 0 or price > 1100:
             return None
 
         uid = str(item.get("id") or item.get("propertyCode") or "")
@@ -111,44 +156,33 @@ def _parse(item: dict) -> Listing | None:
 
         location = item.get("ubication") or item.get("location") or {}
         neighborhood = (
-            location.get("neighbourhood")
-            or location.get("neighborhood")
-            or location.get("district")
-            or item.get("neighborhood")
-            or "Madrid"
+            location.get("neighbourhood") or location.get("district")
+            or item.get("neighborhood") or "Madrid"
         )
-
         features = item.get("features") or item.get("characteristics") or {}
         area_m2 = features.get("constructedArea") or features.get("area") or item.get("area")
 
         images = []
-        for img in item.get("multimedias") or item.get("images") or item.get("photos") or []:
-            if isinstance(img, str):
-                images.append(img)
-            elif isinstance(img, dict):
-                images.append(img.get("url") or img.get("src") or "")
-
-        title = (
-            item.get("suggestedTexts", {}).get("title")
-            or item.get("title")
-            or f"Apartment in {neighborhood}"
-        )
+        for img in item.get("multimedias") or item.get("images") or []:
+            src = img.get("url") or img.get("src") or "" if isinstance(img, dict) else img
+            if src:
+                images.append(src)
 
         return Listing(
             source="fotocasa",
             external_id=uid,
             url=url,
-            title=title,
+            title=item.get("suggestedTexts", {}).get("title") or item.get("title") or f"Apartment in {neighborhood}",
             price_eur=price,
             neighborhood=neighborhood,
             area_m2=int(area_m2) if area_m2 else None,
             furnished=True,
             description=item.get("description") or "",
-            images=[i for i in images if i],
+            images=images[:10],
             lat=location.get("lat") or location.get("latitude"),
             lng=location.get("lng") or location.get("longitude"),
             raw_data=item,
         )
     except Exception as exc:
-        log.warning("Fotocasa parse error: %s | item: %s", exc, item)
+        log.warning("Fotocasa parse error: %s", exc)
         return None

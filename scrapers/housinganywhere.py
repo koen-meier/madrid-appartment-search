@@ -1,150 +1,138 @@
 """
-HousingAnywhere scraper — parses listing cards from the search HTML page.
-Search URL: https://housinganywhere.com/s/Madrid--Spain/furnished-apartments
+HousingAnywhere scraper — uses Playwright to load the JS-rendered page,
+then extracts listing data from __NEXT_DATA__ or the DOM.
 """
 import json
 import logging
 import re
-from bs4 import BeautifulSoup
-from .base import Listing, make_client
+from .base import Listing
 
 log = logging.getLogger(__name__)
 
-SEARCH_URLS = [
-    "https://housinganywhere.com/s/Madrid--Spain/furnished-apartments",
-    "https://housinganywhere.com/s/Madrid--Spain/apartment-for-rent",
-]
+SEARCH_URL = "https://housinganywhere.com/s/Madrid--Spain/furnished-apartments"
 
 
 def scrape() -> list[Listing]:
-    listings = []
-    with make_client() as client:
-        for url in SEARCH_URLS:
-            try:
-                resp = client.get(url)
-                resp.raise_for_status()
-                found = _parse_page(resp.text, url)
-                listings.extend(found)
-                if found:
-                    break
-            except Exception as exc:
-                log.warning("HousingAnywhere fetch failed (%s): %s", url, exc)
-
-    # Deduplicate by external_id
-    seen = set()
-    unique = []
-    for l in listings:
-        if l.external_id not in seen:
-            seen.add(l.external_id)
-            unique.append(l)
-
-    log.info("HousingAnywhere: %d listings", len(unique))
-    return unique
-
-
-def _parse_page(html: str, base_url: str) -> list[Listing]:
-    # Try __NEXT_DATA__ first
-    match = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
-    if match:
-        try:
-            data = json.loads(match.group(1))
-            items = _extract_items(data)
-            if items:
-                log.info("HousingAnywhere: found %d items in __NEXT_DATA__", len(items))
-                return [l for item in items if (l := _parse_item(item))]
-        except Exception as exc:
-            log.warning("HousingAnywhere __NEXT_DATA__ parse error: %s", exc)
-
-    # Fallback: parse HTML cards
-    return _parse_html_cards(html)
-
-
-def _extract_items(data: dict, depth: int = 0) -> list:
-    if depth > 6:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log.error("playwright not installed")
         return []
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        if any(k in data[0] for k in ("price", "rent", "monthlyPrice", "id")):
-            return data
-    if isinstance(data, dict):
-        for v in data.values():
-            result = _extract_items(v, depth + 1)
-            if result:
-                return result
+
+    listings = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            )
+        )
+        try:
+            page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
+
+            # Extract __NEXT_DATA__
+            next_data = page.evaluate("""
+                () => {
+                    const el = document.getElementById('__NEXT_DATA__');
+                    return el ? el.textContent : null;
+                }
+            """)
+
+            if next_data:
+                data = json.loads(next_data)
+                items = _deep_find_listings(data)
+                if items:
+                    listings = [l for item in items if (l := _parse_item(item))]
+                    log.info("HousingAnywhere: %d from __NEXT_DATA__", len(listings))
+
+            if not listings:
+                # Fallback: extract from visible DOM
+                items_json = page.evaluate("""
+                    () => {
+                        const cards = document.querySelectorAll('[data-qa="property-card"], [class*="ListingCard"]');
+                        return Array.from(cards).map(card => {
+                            const link = card.querySelector('a[href]');
+                            const price = card.querySelector('[class*="price"], [data-qa*="price"]');
+                            const title = card.querySelector('h2, h3, [class*="title"]');
+                            const loc = card.querySelector('[class*="location"], [class*="area"]');
+                            const img = card.querySelector('img');
+                            return {
+                                url: link ? link.href : '',
+                                priceText: price ? price.innerText : '',
+                                title: title ? title.innerText : '',
+                                neighborhood: loc ? loc.innerText : 'Madrid',
+                                img: img ? (img.src || img.dataset.src || '') : '',
+                            };
+                        });
+                    }
+                """)
+                listings = [l for item in (items_json or []) if (l := _parse_dom_item(item))]
+                log.info("HousingAnywhere: %d from DOM", len(listings))
+
+        except Exception as exc:
+            log.error("HousingAnywhere scrape error: %s", exc)
+        finally:
+            browser.close()
+
+    filtered = [l for l in listings if l.price_eur and l.price_eur <= 1000]
+    log.info("HousingAnywhere: %d listings after filter", len(filtered))
+    return filtered
+
+
+def _deep_find_listings(obj, depth=0) -> list:
+    if depth > 7:
+        return []
+    if isinstance(obj, list) and len(obj) > 1 and isinstance(obj[0], dict):
+        if any(k in obj[0] for k in ("price", "monthlyPrice", "rent", "id", "homeId")):
+            return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            r = _deep_find_listings(v, depth + 1)
+            if r:
+                return r
     return []
 
 
-def _parse_html_cards(html: str) -> list[Listing]:
-    """Parse listing cards from rendered HTML."""
-    soup = BeautifulSoup(html, "lxml")
-    listings = []
-
-    for card in soup.select("article, [data-testid*='listing'], [class*='ListingCard'], [class*='listing-card']"):
-        try:
-            link = card.select_one("a[href*='/rooms/'], a[href*='/listing/'], a[href*='/apartment/']")
-            if not link:
-                continue
-            href = link.get("href", "")
-            url = href if href.startswith("http") else f"https://housinganywhere.com{href}"
-            uid = href.rstrip("/").split("/")[-1]
-
-            price_el = card.select_one("[class*='price'], [data-testid*='price']")
-            if not price_el:
-                continue
-            price_text = price_el.get_text()
-            price_match = re.search(r"(\d[\d,.]+)", price_text.replace(".", "").replace(",", ""))
-            if not price_match:
-                continue
-            price = int(price_match.group(1))
-            if price <= 0 or price > 1100:
-                continue
-
-            title_el = card.select_one("h2, h3, [class*='title']")
-            title = title_el.get_text(strip=True) if title_el else f"Apartment {uid}"
-
-            location_el = card.select_one("[class*='location'], [class*='neighborhood'], [class*='address']")
-            neighborhood = location_el.get_text(strip=True) if location_el else "Madrid"
-
-            images = []
-            for img in card.select("img[src*='housinganywhere'], img[data-src*='housinganywhere']"):
-                src = img.get("src") or img.get("data-src") or ""
-                if src:
-                    images.append(src)
-
-            listings.append(Listing(
-                source="housinganywhere",
-                external_id=uid or url,
-                url=url,
-                title=title,
-                price_eur=price,
-                neighborhood=neighborhood,
-                furnished=True,
-                images=images[:5],
-                raw_data={"url": url},
-            ))
-        except Exception as exc:
-            log.debug("HousingAnywhere card parse error: %s", exc)
-
-    return listings
+def _parse_dom_item(item: dict) -> Listing | None:
+    try:
+        url = item.get("url", "")
+        uid = url.rstrip("/").split("/")[-1].split("?")[0]
+        nums = re.findall(r"\d+", item.get("priceText", "").replace(".", "").replace(",", ""))
+        if not nums:
+            return None
+        price = int(nums[0])
+        if price <= 0 or price > 1100:
+            return None
+        images = [item["img"]] if item.get("img") else []
+        return Listing(
+            source="housinganywhere",
+            external_id=uid or url,
+            url=url,
+            title=item.get("title") or f"Apartment {uid}",
+            price_eur=price,
+            neighborhood=item.get("neighborhood") or "Madrid",
+            furnished=True,
+            images=images,
+            raw_data=item,
+        )
+    except Exception as exc:
+        log.debug("HousingAnywhere DOM parse error: %s", exc)
+        return None
 
 
 def _parse_item(item: dict) -> Listing | None:
     try:
         price_info = item.get("price") or item.get("monthlyPrice") or item.get("rent") or {}
-        if isinstance(price_info, dict):
-            price = int(price_info.get("amount") or price_info.get("value") or 0)
-        else:
-            price = int(price_info)
+        price = int(price_info.get("amount") or price_info.get("value") or 0) if isinstance(price_info, dict) else int(price_info or 0)
         if price <= 0 or price > 1100:
             return None
 
         uid = str(item.get("id") or item.get("slug") or "")
         slug = item.get("slug") or uid
         url = f"https://housinganywhere.com/listing/{slug}" if slug else ""
-
-        neighborhood = (
-            item.get("neighborhood") or item.get("area")
-            or item.get("district") or item.get("city", "Madrid")
-        )
+        neighborhood = item.get("neighborhood") or item.get("area") or item.get("district") or item.get("city", "Madrid")
 
         images = []
         for img in item.get("images") or item.get("photos") or []:

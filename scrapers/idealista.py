@@ -11,8 +11,14 @@ from .base import Listing
 log = logging.getLogger(__name__)
 
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
-ACTOR_ID = "igolaizola~idealista-scraper"
+ACTOR_ID = "lukass~idealista-scraper"
 RUN_URL = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs"
+
+# Madrid furnished rentals under €1000 — temporal (mid-term) + long-term
+SEARCH_URLS = [
+    "https://www.idealista.com/alquiler-viviendas/madrid-madrid/con-precio-hasta_1000,amueblado/",
+    "https://www.idealista.com/alquiler-viviendas/madrid-madrid/con-precio-hasta_1000,amueblado,alquiler-temporal/",
+]
 
 
 def scrape() -> list[Listing]:
@@ -27,13 +33,9 @@ def scrape() -> list[Listing]:
             RUN_URL,
             headers=headers,
             json={
-                "operation": "rent",
-                "propertyType": "homes",
-                "country": "es",
-                "location": "Madrid",
-                "maxPrice": "1000",
+                "startUrls": [{"url": u} for u in SEARCH_URLS],
                 "maxItems": 100,
-                "sortBy": "mostRecent",
+                "proxyConfiguration": {"useApifyProxy": True},
             },
             timeout=30,
         )
