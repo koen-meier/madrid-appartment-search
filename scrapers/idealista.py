@@ -14,10 +14,8 @@ log = logging.getLogger(__name__)
 SEARCH_URL = "https://www.idealista.com/alquiler-viviendas/madrid-madrid/con-precio-hasta_1000,amueblado/"
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
 
-# Actors to try in order (fall through if one returns 0)
+# epctex → 404, dtrungtin → 403 (private). lukass needs residential proxy + correct schema.
 ACTORS = [
-    "epctex/idealista-scraper",
-    "dtrungtin/idealista-scraper",
     "lukass/idealista-scraper",
 ]
 
@@ -55,13 +53,17 @@ def _run_actor(actor_id: str) -> list[Listing]:
             "maxItems": 50,
         }
     else:
-        # lukass / generic
+        # lukass — requires country, operation, proxy (residential IPs)
         payload = {
-            "locationName": "Madrid",
+            "country": "es",
             "operation": "rent",
+            "district": "Madrid",
             "propertyType": "homes",
-            "maxPrice": 1000,
             "maxItems": 50,
+            "proxy": {
+                "useApifyProxy": True,
+                "apifyProxyGroups": ["RESIDENTIAL"],
+            },
         }
 
     try:
