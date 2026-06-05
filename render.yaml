@@ -2,6 +2,7 @@ services:
   - type: web
     name: madrid-dashboard
     env: static
+    buildCommand: echo done
     staticPublishPath: ./dashboard
     headers:
       - path: /*
