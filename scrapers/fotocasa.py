@@ -1,9 +1,14 @@
 """
-Fotocasa scraper — Playwright to bypass 405/anti-bot, extract __INITIAL_PROPS__ or DOM.
+Fotocasa — Apify actor scraper (bypasses bot detection).
+Falls back to httpx HTML scraping if no APIFY_TOKEN.
 """
 import json
 import logging
+import os
 import re
+import time
+import httpx
+from bs4 import BeautifulSoup
 from .base import Listing
 
 log = logging.getLogger(__name__)
@@ -12,191 +17,229 @@ SEARCH_URL = (
     "https://www.fotocasa.es/es/alquiler/viviendas/madrid-capital/todas-las-zonas/l"
     "?maxPrice=1000&furnished=1"
 )
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
+
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+}
 
 
 def scrape() -> list[Listing]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        log.error("playwright not installed")
-        return []
+    # Try Apify first
+    if APIFY_TOKEN:
+        listings = _try_apify()
+        if listings:
+            return listings
+        log.info("Fotocasa: Apify returned 0, trying httpx")
 
-    listings = []
-    with sync_playwright() as p:
-        browser = p.firefox.launch(headless=True)
-        page = browser.new_page(
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"
-            )
-        )
-        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+    # Fallback: direct httpx
+    return _try_httpx()
+
+
+def _try_apify() -> list[Listing]:
+    """Try apify.com/epctex/fotocasa-scraper or similar."""
+    base = "https://api.apify.com/v2"
+    headers = {"Authorization": f"Bearer {APIFY_TOKEN}", "Content-Type": "application/json"}
+
+    actors_configs = [
+        ("epctex/fotocasa-scraper", {
+            "startUrls": [{"url": SEARCH_URL}],
+            "maxItems": 50,
+            "proxyConfiguration": {"useApifyProxy": True},
+        }),
+        ("epctex/web-scraper", {
+            "startUrls": [{"url": SEARCH_URL}],
+            "pageFunction": """
+async function pageFunction({ $, request }) {
+    const items = [];
+    $('[class*="re-Card"], [class*="CardPackMinimal"], article').each((i, el) => {
+        const link = $(el).find('a[href]').first();
+        const price = $(el).find('[class*="re-CardPrice"], [class*="price"]').first();
+        const title = $(el).find('h2, h3, [class*="title"]').first();
+        const loc = $(el).find('[class*="location"]').first();
+        items.push({
+            url: link.attr('href') || '',
+            priceText: price.text().trim(),
+            title: title.text().trim(),
+            neighborhood: loc.text().trim() || 'Madrid',
+        });
+    });
+    return items;
+}
+""",
+            "maxRequestsPerCrawl": 3,
+        }),
+    ]
+
+    for actor_id, payload in actors_configs:
         try:
-            page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
+            with httpx.Client(timeout=90) as client:
+                actor_slug = actor_id.replace("/", "~")
+                r = client.post(
+                    f"{base}/acts/{actor_slug}/runs",
+                    headers=headers,
+                    json=payload,
+                    params={"waitForFinish": 120},
+                )
+                log.info("Fotocasa Apify %s: start status=%d", actor_id, r.status_code)
+                if r.status_code not in (200, 201):
+                    log.info("Fotocasa Apify %s: %s", actor_id, r.text[:200])
+                    continue
 
-            # Log page title to diagnose bot detection
-            log.info("Fotocasa page title: %s", page.title())
-            log.info("Fotocasa body start: %s", page.evaluate("() => document.body.innerText.slice(0, 200)"))
+                run_data = r.json()
+                run_id = run_data.get("data", {}).get("id") or run_data.get("id")
+                if not run_id:
+                    continue
 
-            # Accept cookie banner
-            for selector in ["#didomi-notice-agree-button", "button:has-text('Aceptar todo')",
-                              "button:has-text('Aceptar')", "button:has-text('Accept all')",
-                              "[data-testid='accept-button']"]:
-                try:
-                    page.click(selector, timeout=3000)
-                    page.wait_for_timeout(2000)
-                    break
-                except Exception:
-                    pass
+                for _ in range(20):
+                    sr = client.get(f"{base}/actor-runs/{run_id}", headers=headers)
+                    status = sr.json().get("data", {}).get("status", "")
+                    if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+                        break
+                    time.sleep(10)
 
-            # Wait for listing cards
-            try:
-                page.wait_for_selector("[class*='re-Card'], article[class*='card']", timeout=8000)
-            except Exception:
-                pass
+                if status != "SUCCEEDED":
+                    log.warning("Fotocasa Apify %s: %s", actor_id, status)
+                    continue
 
-            # Try to extract embedded JSON
-            props = page.evaluate("""
-                () => {
-                    for (const key of ['__INITIAL_PROPS__', '__SERVER_PROPS__', '__NUXT__']) {
-                        if (window[key]) return JSON.stringify(window[key]);
-                    }
-                    const scripts = document.querySelectorAll('script:not([src])');
-                    for (const s of scripts) {
-                        if (s.textContent.includes('"realEstates"')) return s.textContent;
-                    }
-                    return null;
-                }
-            """)
+                dataset_id = sr.json().get("data", {}).get("defaultDatasetId", "")
+                items_r = client.get(
+                    f"{base}/datasets/{dataset_id}/items",
+                    headers=headers,
+                    params={"format": "json", "limit": 200},
+                )
+                items = items_r.json()
+                log.info("Fotocasa Apify %s: %d items", actor_id, len(items))
 
-            if props:
-                try:
-                    data = json.loads(props)
-                    items = (
-                        data.get("realEstates")
-                        or data.get("listings")
-                        or _deep_find(data, "realEstates")
-                        or []
-                    )
-                    listings = [l for item in items if (l := _parse_item(item))]
-                    log.info("Fotocasa: %d from page data", len(listings))
-                except Exception as exc:
-                    log.warning("Fotocasa props parse error: %s", exc)
-
-            if not listings:
-                items_json = page.evaluate("""
-                    () => {
-                        const cards = document.querySelectorAll('[class*="re-CardPackMinimal"], [class*="CardPackPremium"], article');
-                        return Array.from(cards).slice(0, 80).map(card => {
-                            const link = card.querySelector('a[href]');
-                            const price = card.querySelector('[class*="re-CardPrice"], [class*="price"]');
-                            const title = card.querySelector('h2, h3, [class*="title"]');
-                            const loc = card.querySelector('[class*="CardLocation"], [class*="location"]');
-                            const img = card.querySelector('img');
-                            return {
-                                url: link ? link.href : '',
-                                priceText: price ? price.innerText : '',
-                                title: title ? title.innerText : '',
-                                neighborhood: loc ? loc.innerText : 'Madrid',
-                                img: img ? (img.src || img.dataset.src || '') : '',
-                            };
-                        }).filter(x => x.url && x.priceText);
-                    }
-                """)
-                listings = [l for item in (items_json or []) if (l := _parse_dom_item(item))]
-                log.info("Fotocasa: %d from DOM", len(listings))
+                listings = []
+                for item in items:
+                    l = _parse_apify_item(item)
+                    if l:
+                        listings.append(l)
+                if listings:
+                    return listings
 
         except Exception as exc:
-            log.error("Fotocasa scrape error: %s", exc)
-        finally:
-            browser.close()
+            log.error("Fotocasa Apify %s error: %s", actor_id, exc)
 
-    filtered = [l for l in listings if l.price_eur and l.price_eur <= 1000]
-    log.info("Fotocasa: %d listings after filter", len(filtered))
-    return filtered
+    return []
 
 
-def _deep_find(obj, key, depth=0):
-    if depth > 5:
-        return None
-    if isinstance(obj, dict):
-        if key in obj:
-            return obj[key]
-        for v in obj.values():
-            r = _deep_find(v, key, depth + 1)
-            if r:
-                return r
-    return None
-
-
-def _parse_dom_item(item: dict) -> Listing | None:
+def _try_httpx() -> list[Listing]:
+    """Direct httpx fetch — likely blocked but worth trying."""
     try:
-        url = item.get("url", "")
-        if url and not url.startswith("http"):
-            url = "https://www.fotocasa.es" + url
-        uid = url.rstrip("/").split("/")[-1].split("?")[0]
-        nums = re.findall(r"\d+", item.get("priceText", "").replace(".", "").replace(",", ""))
-        if not nums:
-            return None
-        price = int(nums[0])
-        if price <= 0 or price > 1100:
-            return None
-        return Listing(
-            source="fotocasa",
-            external_id=uid or url,
-            url=url,
-            title=item.get("title") or f"Apartment {uid}",
-            price_eur=price,
-            neighborhood=item.get("neighborhood") or "Madrid",
-            furnished=True,
-            images=[item["img"]] if item.get("img") else [],
-            raw_data=item,
-        )
+        with httpx.Client(headers=_HEADERS, timeout=30, follow_redirects=True) as client:
+            resp = client.get(SEARCH_URL)
+            log.info("Fotocasa httpx: status=%d len=%d", resp.status_code, len(resp.text))
+            log.info("Fotocasa httpx body: %s", resp.text[:200])
+            if resp.status_code != 200:
+                return []
+
+            html = resp.text
+            # Try __INITIAL_PROPS__ or embedded JSON
+            for pat in [r'window\.__INITIAL_PROPS__\s*=\s*(\{.*?\});\s*(?:window|</)',
+                        r'"realEstates"\s*:\s*(\[.*?\])',
+                        r'window\.__SERVER_PROPS__\s*=\s*(\{.*?\})']:
+                m = re.search(pat, html, re.DOTALL)
+                if m:
+                    try:
+                        data = json.loads(m.group(1))
+                        items = (
+                            data.get("realEstates")
+                            or data.get("listings")
+                            or (data if isinstance(data, list) else [])
+                        )
+                        listings = [l for item in items if (l := _parse_fotocasa_item(item))]
+                        if listings:
+                            log.info("Fotocasa httpx: %d listings from embedded JSON", len(listings))
+                            return [l for l in listings if l.price_eur and l.price_eur <= 1000]
+                    except Exception:
+                        pass
+
+            # DOM parse
+            soup = BeautifulSoup(html, "lxml")
+            cards = soup.find_all(class_=re.compile(r"re-Card|CardPackMinimal"))
+            log.info("Fotocasa httpx DOM cards: %d", len(cards))
+            listings = []
+            for card in cards[:80]:
+                link = card.find("a", href=True)
+                price_el = card.find(class_=re.compile(r"re-CardPrice|price"))
+                title_el = card.find(["h2", "h3"])
+                if not link or not price_el:
+                    continue
+                url = link["href"]
+                if not url.startswith("http"):
+                    url = "https://www.fotocasa.es" + url
+                nums = re.findall(r"\d+", price_el.get_text().replace(".", ""))
+                if not nums:
+                    continue
+                price = int(nums[0])
+                if price <= 0 or price > 1100:
+                    continue
+                uid = url.rstrip("/").split("/")[-1].split("?")[0]
+                listings.append(Listing(
+                    source="fotocasa", external_id=uid, url=url,
+                    title=(title_el.get_text().strip() if title_el else f"Apartment {uid}"),
+                    price_eur=price, neighborhood="Madrid", furnished=True,
+                    raw_data={"url": url, "price": price},
+                ))
+            return listings
+
     except Exception as exc:
-        log.debug("Fotocasa DOM parse error: %s", exc)
-        return None
+        log.error("Fotocasa httpx error: %s", exc)
+    return []
 
 
-def _parse_item(item: dict) -> Listing | None:
+def _parse_apify_item(item: dict) -> "Listing | None":
     try:
         price_info = item.get("priceInfo") or item.get("price") or {}
-        price = int(price_info.get("price") or price_info.get("amount") or 0) if isinstance(price_info, dict) else int(price_info or 0)
+        price = (
+            int(price_info.get("price") or price_info.get("amount") or 0)
+            if isinstance(price_info, dict)
+            else int(price_info or 0)
+        )
+        if price <= 0:
+            # Try priceText
+            price_text = item.get("priceText", "")
+            nums = re.findall(r"\d+", price_text.replace(".", ""))
+            price = int(nums[0]) if nums else 0
         if price <= 0 or price > 1100:
             return None
 
         uid = str(item.get("id") or item.get("propertyCode") or "")
-        url = item.get("detail", {}).get("es") or item.get("url") or ""
+        url = item.get("url") or item.get("detail", {}).get("es") or ""
         if url and not url.startswith("http"):
             url = "https://www.fotocasa.es" + url
+        if not uid:
+            uid = url.rstrip("/").split("/")[-1].split("?")[0]
 
         location = item.get("ubication") or item.get("location") or {}
         neighborhood = (
             location.get("neighbourhood") or location.get("district")
             or item.get("neighborhood") or "Madrid"
         )
-        features = item.get("features") or item.get("characteristics") or {}
-        area_m2 = features.get("constructedArea") or features.get("area") or item.get("area")
 
         images = []
         for img in item.get("multimedias") or item.get("images") or []:
-            src = img.get("url") or img.get("src") or "" if isinstance(img, dict) else img
+            src = (img.get("url") or img.get("src") or "") if isinstance(img, dict) else str(img)
             if src:
                 images.append(src)
 
         return Listing(
-            source="fotocasa",
-            external_id=uid,
-            url=url,
-            title=item.get("suggestedTexts", {}).get("title") or item.get("title") or f"Apartment in {neighborhood}",
-            price_eur=price,
-            neighborhood=neighborhood,
-            area_m2=int(area_m2) if area_m2 else None,
-            furnished=True,
-            description=item.get("description") or "",
-            images=images[:10],
-            lat=location.get("lat") or location.get("latitude"),
-            lng=location.get("lng") or location.get("longitude"),
-            raw_data=item,
+            source="fotocasa", external_id=uid, url=url,
+            title=item.get("title") or f"Apartment in {neighborhood}",
+            price_eur=price, neighborhood=neighborhood, furnished=True,
+            images=images[:10], raw_data=item,
         )
     except Exception as exc:
-        log.warning("Fotocasa parse error: %s", exc)
+        log.debug("Fotocasa parse error: %s", exc)
         return None
+
+
+def _parse_fotocasa_item(item: dict) -> "Listing | None":
+    return _parse_apify_item(item)

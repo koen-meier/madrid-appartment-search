@@ -1,224 +1,190 @@
 """
-Idealista — httpx HTML scraping (primary) with Playwright Firefox fallback.
+Idealista — Apify actor scraper (bypasses DataDome bot protection).
+Uses epctex/idealista-scraper which runs on residential IPs.
 """
 import json
 import logging
-import re
+import os
+import time
 import httpx
-from bs4 import BeautifulSoup
 from .base import Listing
 
 log = logging.getLogger(__name__)
 
 SEARCH_URL = "https://www.idealista.com/alquiler-viviendas/madrid-madrid/con-precio-hasta_1000,amueblado/"
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
 
-_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "es-ES,es;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Cache-Control": "max-age=0",
-}
+# Actors to try in order (fall through if one returns 0)
+ACTORS = [
+    "epctex/idealista-scraper",
+    "dtrungtin/idealista-scraper",
+    "lukass/idealista-scraper",
+]
 
 
 def scrape() -> list[Listing]:
-    listings = _try_httpx()
-    if not listings:
-        log.info("Idealista: httpx returned nothing, trying Playwright Firefox")
-        listings = _try_playwright()
-    filtered = [l for l in listings if l.price_eur and l.price_eur <= 1000]
-    log.info("Idealista: %d listings", len(filtered))
-    return filtered
-
-
-def _try_httpx() -> list[Listing]:
-    listings = []
-    try:
-        with httpx.Client(headers=_HEADERS, timeout=30, follow_redirects=True) as client:
-            resp = client.get(SEARCH_URL)
-            log.info("Idealista httpx: status=%d url=%s len=%d",
-                     resp.status_code, str(resp.url)[:80], len(resp.text))
-            log.info("Idealista httpx body start: %s", resp.text[:400])
-
-            if resp.status_code != 200:
-                return []
-
-            soup = BeautifulSoup(resp.text, "lxml")
-
-            # Try JSON-LD structured data
-            for script in soup.find_all("script", type="application/ld+json"):
-                try:
-                    data = json.loads(script.string or "")
-                    log.info("Idealista JSON-LD: %s", str(data)[:200])
-                    items = _extract_items(data)
-                    for item in items:
-                        l = _parse_item(item)
-                        if l: listings.append(l)
-                except Exception:
-                    pass
-
-            # Try embedded window.* JSON state
-            for script in soup.find_all("script"):
-                text = script.string or ""
-                for pat in [
-                    r'window\.__INITIAL_DATA__\s*=\s*({.+?});?\s*(?:window|</)',
-                    r'window\.searchData\s*=\s*({.+?});?\s*(?:window|</)',
-                    r'"items"\s*:\s*(\[.+?\])',
-                    r'"elementList"\s*:\s*(\[.+?\])',
-                ]:
-                    m = re.search(pat, text, re.DOTALL)
-                    if m:
-                        try:
-                            data = json.loads(m.group(1))
-                            log.info("Idealista script data (pattern %s): %s", pat[:30], str(data)[:300])
-                            items = _extract_items(data) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                            for item in items:
-                                l = _parse_item(item)
-                                if l: listings.append(l)
-                        except Exception:
-                            pass
-
-            # DOM parse listing articles
-            articles = soup.select("article.item, [class*='item-info']")
-            log.info("Idealista DOM articles: %d", len(articles))
-            for art in articles[:60]:
-                link = art.select_one("a.item-link, a[href*='/inmueble/']")
-                price_el = art.select_one(".price-row, [class*='price']")
-                title_el = art.select_one(".item-title, h2, h3")
-                if not link or not price_el:
-                    continue
-                url = link.get("href", "")
-                if url and not url.startswith("http"):
-                    url = "https://www.idealista.com" + url
-                uid_m = re.search(r"/inmueble/(\d+)/", url)
-                uid = uid_m.group(1) if uid_m else url.rstrip("/").split("/")[-1]
-                nums = re.findall(r"\d+", price_el.get_text().replace(".", ""))
-                if not nums: continue
-                price = int(nums[0])
-                if price <= 0 or price > 1100: continue
-                listings.append(Listing(
-                    source="idealista", external_id=uid, url=url,
-                    title=(title_el.get_text().strip() if title_el else f"Apartment {uid}"),
-                    price_eur=price, neighborhood="Madrid",
-                    furnished=True, raw_data={"url": url, "price": price},
-                ))
-
-    except Exception as exc:
-        log.error("Idealista httpx error: %s", exc)
-
-    seen, unique = set(), []
-    for l in listings:
-        if l.external_id not in seen:
-            seen.add(l.external_id); unique.append(l)
-    return unique
-
-
-def _try_playwright() -> list[Listing]:
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
+    if not APIFY_TOKEN:
+        log.warning("Idealista: APIFY_TOKEN not set, skipping")
         return []
 
-    listings = []
-    with sync_playwright() as p:
-        browser = p.firefox.launch(headless=True)
-        page = browser.new_page(user_agent=(
-            "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"
-        ))
-        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-        try:
-            page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
-            for sel in ["#didomi-notice-agree-button", "button:has-text('Aceptar')"]:
-                try:
-                    page.click(sel, timeout=2000); page.wait_for_timeout(2000); break
-                except Exception: pass
-            page.wait_for_timeout(2000)
-            title = page.title()
-            body = page.evaluate("() => document.body.innerText.slice(0, 300)")
-            log.info("Idealista Firefox title: %s | body: %s", title, body)
+    for actor in ACTORS:
+        listings = _run_actor(actor)
+        if listings:
+            log.info("Idealista: %d listings via %s", len(listings), actor)
+            return listings
+        log.info("Idealista: actor %s returned 0, trying next", actor)
 
-            items_json = page.evaluate("""
-                () => {
-                    const cards = document.querySelectorAll('article.item, [class*="item-info"]');
-                    return Array.from(cards).slice(0, 60).map(card => {
-                        const link = card.querySelector('a.item-link, a[href*="/inmueble/"]');
-                        const price = card.querySelector('.price-row, [class*="price"]');
-                        const title = card.querySelector('.item-title, h2, h3');
-                        return {
-                            url: link ? (link.href || link.getAttribute('href')) : '',
-                            priceText: price ? price.innerText : '',
-                            title: title ? title.innerText : '',
-                        };
-                    }).filter(x => x.url && x.priceText);
-                }
-            """)
-            log.info("Idealista Firefox DOM cards: %d", len(items_json or []))
-            for item in (items_json or []):
-                url = item.get("url", "")
-                if url and not url.startswith("http"):
-                    url = "https://www.idealista.com" + url
-                uid_m = re.search(r"/inmueble/(\d+)/", url)
-                uid = uid_m.group(1) if uid_m else url.rstrip("/").split("/")[-1]
-                nums = re.findall(r"\d+", item.get("priceText", "").replace(".", ""))
-                if not nums: continue
-                price = int(nums[0])
-                if 0 < price <= 1100:
-                    listings.append(Listing(source="idealista", external_id=uid, url=url,
-                                            title=item.get("title") or f"Apartment {uid}",
-                                            price_eur=price, neighborhood="Madrid",
-                                            furnished=True, raw_data=item))
-        except Exception as exc:
-            log.error("Idealista Playwright error: %s", exc)
-        finally:
-            browser.close()
-
-    return listings
-
-
-def _extract_items(data, depth=0) -> list:
-    if depth > 5: return []
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        if any(k in data[0] for k in ("price", "priceInfo", "propertyCode", "id")):
-            return data
-    if isinstance(data, dict):
-        for v in data.values():
-            r = _extract_items(v, depth + 1)
-            if r: return r
+    log.warning("Idealista: all actors returned 0")
     return []
+
+
+def _run_actor(actor_id: str) -> list[Listing]:
+    base = "https://api.apify.com/v2"
+    headers = {"Authorization": f"Bearer {APIFY_TOKEN}", "Content-Type": "application/json"}
+
+    # Actor-specific input configs
+    if "epctex" in actor_id:
+        payload = {
+            "startUrls": [{"url": SEARCH_URL}],
+            "maxItems": 50,
+            "proxyConfiguration": {"useApifyProxy": True},
+        }
+    elif "dtrungtin" in actor_id:
+        payload = {
+            "startUrls": [{"url": SEARCH_URL}],
+            "maxItems": 50,
+        }
+    else:
+        # lukass / generic
+        payload = {
+            "locationName": "Madrid",
+            "operation": "rent",
+            "propertyType": "homes",
+            "maxPrice": 1000,
+            "maxItems": 50,
+        }
+
+    try:
+        with httpx.Client(timeout=60) as client:
+            # Start the actor run
+            actor_slug = actor_id.replace("/", "~")
+            r = client.post(
+                f"{base}/acts/{actor_slug}/runs",
+                headers=headers,
+                json=payload,
+                params={"waitForFinish": 120},
+            )
+            log.info("Idealista Apify %s: start status=%d", actor_id, r.status_code)
+            if r.status_code not in (200, 201):
+                log.info("Idealista Apify %s response: %s", actor_id, r.text[:200])
+                return []
+
+            run_data = r.json()
+            run_id = run_data.get("data", {}).get("id") or run_data.get("id")
+            if not run_id:
+                log.info("Idealista Apify %s: no run id in %s", actor_id, str(run_data)[:200])
+                return []
+
+            # Poll until done (waitForFinish handles this but let's be safe)
+            for _ in range(20):
+                status_r = client.get(f"{base}/actor-runs/{run_id}", headers=headers)
+                status = status_r.json().get("data", {}).get("status", "")
+                log.info("Idealista Apify %s run %s: %s", actor_id, run_id, status)
+                if status in ("SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"):
+                    break
+                time.sleep(10)
+
+            if status != "SUCCEEDED":
+                log.warning("Idealista Apify %s: run ended with status %s", actor_id, status)
+                return []
+
+            # Get results from default dataset
+            dataset_id = status_r.json().get("data", {}).get("defaultDatasetId", "")
+            if not dataset_id:
+                return []
+
+            items_r = client.get(
+                f"{base}/datasets/{dataset_id}/items",
+                headers=headers,
+                params={"format": "json", "limit": 200},
+            )
+            items = items_r.json()
+            log.info("Idealista Apify %s: %d items in dataset", actor_id, len(items))
+
+            listings = []
+            for item in items:
+                l = _parse_item(item)
+                if l:
+                    listings.append(l)
+            return listings
+
+    except Exception as exc:
+        log.error("Idealista Apify %s error: %s", actor_id, exc)
+        return []
 
 
 def _parse_item(item: dict) -> "Listing | None":
     try:
-        price = item.get("price") or item.get("priceInfo", {}).get("price") or 0
-        price = int(str(price).replace(".", "").split()[0])
-        if price <= 0 or price > 1100: return None
+        # Handle various actor output formats
+        price = (
+            item.get("price")
+            or item.get("priceInfo", {}).get("price")
+            or item.get("monthlyPrice")
+            or 0
+        )
+        if isinstance(price, str):
+            price = int("".join(filter(str.isdigit, price)) or "0")
+        price = int(price)
+        if price <= 0 or price > 1100:
+            return None
 
-        uid = str(item.get("propertyCode") or item.get("id") or "")
+        uid = str(
+            item.get("propertyCode")
+            or item.get("id")
+            or item.get("listingId")
+            or item.get("url", "").rstrip("/").split("/")[-1]
+            or ""
+        )
+        if not uid:
+            return None
+
         url = item.get("url") or item.get("detailUrl") or ""
         if url and not url.startswith("http"):
             url = "https://www.idealista.com" + url
 
-        neighborhood = item.get("neighborhood") or item.get("district") or "Madrid"
+        neighborhood = (
+            item.get("neighborhood")
+            or item.get("district")
+            or item.get("location")
+            or "Madrid"
+        )
+
         images = []
         for img in item.get("images") or item.get("photos") or []:
-            src = (img.get("url") or img.get("src") or "") if isinstance(img, dict) else img
-            if src: images.append(src)
+            src = (img.get("url") or img.get("src") or "") if isinstance(img, dict) else str(img)
+            if src:
+                images.append(src)
 
-        return Listing(source="idealista", external_id=uid, url=url,
-                       title=(item.get("suggestedTexts", {}).get("title") or
-                              item.get("title") or f"Apt in {neighborhood}"),
-                       price_eur=price, neighborhood=neighborhood,
-                       area_m2=item.get("size") or item.get("area"),
-                       furnished=True, description=item.get("description") or "",
-                       images=images[:10], lat=item.get("latitude"), lng=item.get("longitude"),
-                       raw_data=item)
+        return Listing(
+            source="idealista",
+            external_id=uid,
+            url=url,
+            title=(
+                item.get("suggestedTexts", {}).get("title")
+                or item.get("title")
+                or item.get("description", "")[:80]
+                or f"Apartment in {neighborhood}"
+            ),
+            price_eur=price,
+            neighborhood=neighborhood,
+            area_m2=item.get("size") or item.get("area"),
+            furnished=True,
+            description=item.get("description") or "",
+            images=images[:10],
+            lat=item.get("latitude") or item.get("lat"),
+            lng=item.get("longitude") or item.get("lng"),
+            raw_data=item,
+        )
     except Exception as exc:
-        log.debug("Idealista parse error: %s", exc); return None
+        log.debug("Idealista parse error: %s", exc)
+        return None
