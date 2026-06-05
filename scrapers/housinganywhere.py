@@ -78,8 +78,8 @@ def scrape() -> list[Listing]:
             seen.add(l.external_id)
             unique.append(l)
 
-    filtered = [l for l in unique if l.price_eur and l.price_eur <= 1000]
-    log.info("HousingAnywhere: %d listings (≤€1000)", len(filtered))
+    filtered = [l for l in unique if l.price_eur and l.price_eur <= 1200]
+    log.info("HousingAnywhere: %d listings (≤€1200)", len(filtered))
     return filtered
 
 
@@ -88,7 +88,7 @@ def _parse_item(item: dict) -> "Listing | None":
         # priceEUR is the monthly EUR price; minPrice is the minimum price
         price = item.get("priceEUR") or item.get("minPrice") or 0
         price = int(price)
-        if price <= 0 or price > 1100:
+        if price <= 0 or price > 1200:
             return None
 
         uid = str(item.get("id") or item.get("unitTypeInternalID") or item.get("objectID") or "")

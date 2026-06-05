@@ -59,8 +59,8 @@ def scrape() -> list[Listing]:
             seen.add(l.external_id)
             unique.append(l)
 
-    filtered = [l for l in unique if l.price_eur and l.price_eur <= 1000]
-    log.info("Spotahome: %d listings (≤€1000)", len(filtered))
+    filtered = [l for l in unique if l.price_eur and l.price_eur <= 1200]
+    log.info("Spotahome: %d listings (≤€1200)", len(filtered))
     return filtered
 
 

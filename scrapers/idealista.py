@@ -11,7 +11,7 @@ from .base import Listing
 
 log = logging.getLogger(__name__)
 
-SEARCH_URL = "https://www.idealista.com/alquiler-viviendas/madrid-madrid/con-precio-hasta_1000,amueblado/"
+SEARCH_URL = "https://www.idealista.com/alquiler-viviendas/madrid-madrid/con-precio-hasta_1200,amueblado/"
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN", "")
 
 # epctex → 404, dtrungtin → 403 (private). lukass needs residential proxy + correct schema.
@@ -137,7 +137,7 @@ def _parse_item(item: dict) -> "Listing | None":
         if isinstance(price, str):
             price = int("".join(filter(str.isdigit, price)) or "0")
         price = int(price)
-        if price <= 0 or price > 1100:
+        if price <= 0 or price > 1200:
             return None
 
         uid = str(
