@@ -2,9 +2,9 @@
 Spotahome — httpx HTML scraping of SSR search results pages.
 Listings are server-side rendered when dates are provided in the URL.
 """
-import json
 import logging
 import re
+import time
 import httpx
 from bs4 import BeautifulSoup
 from .base import Listing
@@ -61,7 +61,30 @@ def scrape() -> list[Listing]:
 
     filtered = [l for l in unique if l.price_eur and l.price_eur <= 1200]
     log.info("Spotahome: %d listings (≤€1200)", len(filtered))
+
+    # Enrich each listing with lat/lng from its detail page
+    with httpx.Client(headers=_HEADERS, timeout=20, follow_redirects=True) as client:
+        for l in filtered:
+            try:
+                resp = client.get(l.url)
+                if resp.status_code == 200:
+                    lat, lng = _extract_coords(resp.text)
+                    if lat and lng:
+                        l.lat = lat
+                        l.lng = lng
+                time.sleep(0.5)
+            except Exception as exc:
+                log.debug("Spotahome coords fetch error %s: %s", l.external_id, exc)
+
     return filtered
+
+
+def _extract_coords(html: str):
+    # Coords appear as: "coord",[ref1,ref2],LNG,LAT in the page data
+    m = re.search(r'"coord",\[[^\]]+\],([-0-9.]+),([-0-9.]+)', html)
+    if m:
+        return float(m.group(2)), float(m.group(1))  # lat, lng
+    return None, None
 
 
 def _parse_page(html: str) -> list[Listing]:
