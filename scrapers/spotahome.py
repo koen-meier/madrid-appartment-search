@@ -1,18 +1,93 @@
 """
-Spotahome — intercepts internal JSON API calls during page load.
+Spotahome — direct GraphQL via httpx, with Playwright fallback.
 """
+import json
 import logging
+import httpx
 from .base import Listing
 
 log = logging.getLogger(__name__)
-SEARCH_URL = "https://www.spotahome.com/s/madrid/for-rent:apartments?checkIn=2026-08-01&checkOut=2026-12-31&maxPrice=100000"
+
+GRAPHQL_URL = "https://www.spotahome.com/marketplace/graphql"
+CITY_PAGE_URL = "https://www.spotahome.com/s/madrid/for-rent:apartments?checkIn=2026-08-01&checkOut=2026-12-31&maxPrice=100000"
+
+_GQL_HEADERS = {
+    "Content-Type": "application/json",
+    "Accept": "application/json",
+    "Referer": "https://www.spotahome.com/s/madrid/for-rent:apartments",
+    "Origin": "https://www.spotahome.com",
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 def scrape() -> list[Listing]:
+    listings = _try_graphql_direct()
+    if not listings:
+        log.info("Spotahome: direct GraphQL returned nothing, trying Playwright")
+        listings = _try_playwright()
+
+    filtered = [l for l in listings if l.price_eur and l.price_eur <= 1000]
+    log.info("Spotahome: %d listings", len(filtered))
+    return filtered
+
+
+def _try_graphql_direct() -> list[Listing]:
+    listings = []
+    try:
+        with httpx.Client(headers=_GQL_HEADERS, timeout=30, follow_redirects=True) as client:
+            # Discover available query names via introspection
+            r = client.post(GRAPHQL_URL, json={
+                "query": "{ __schema { queryType { fields { name } } } }"
+            })
+            if r.status_code == 200:
+                fields = (r.json().get("data") or {}).get("__schema", {}).get("queryType", {}).get("fields", [])
+                names = [f["name"] for f in fields]
+                log.info("Spotahome available GraphQL queries: %s", names)
+
+                # Find likely listing search queries
+                search_queries = [n for n in names if any(k in n.lower() for k in
+                    ("search", "listing", "home", "apartment", "room", "rental", "property"))]
+                log.info("Spotahome candidate listing queries: %s", search_queries)
+
+                # Try each candidate query with minimal field selection to see what works
+                for qname in search_queries[:5]:
+                    try:
+                        r2 = client.post(GRAPHQL_URL, json={
+                            "operationName": qname,
+                            "variables": {
+                                "cityId": "madrid",
+                                "city": "madrid",
+                                "checkIn": "2026-08-01",
+                                "checkOut": "2026-12-31",
+                                "maxPrice": 100000,
+                                "propertyType": "apartment",
+                                "page": 1,
+                                "limit": 50,
+                            },
+                            "query": f"query {qname} {{ {qname} {{ __typename }} }}"
+                        })
+                        log.info("Spotahome query %s: status=%d body=%s",
+                                 qname, r2.status_code, r2.text[:200])
+                    except Exception as e:
+                        log.info("Spotahome query %s failed: %s", qname, e)
+            else:
+                log.info("Spotahome introspection: status=%d body=%s", r.status_code, r.text[:300])
+
+    except Exception as exc:
+        log.error("Spotahome GraphQL direct error: %s", exc)
+
+    return listings
+
+
+def _try_playwright() -> list[Listing]:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        log.error("playwright not installed"); return []
+        return []
 
     captured = []
     gql_queries = []
@@ -20,23 +95,17 @@ def scrape() -> list[Listing]:
     def on_request(req):
         try:
             if "graphql" in req.url and req.method == "POST":
-                body = req.post_data or ""
-                gql_queries.append(body[:300])
+                gql_queries.append((req.post_data or "")[:400])
         except Exception:
             pass
 
     def on_response(resp):
         try:
             ct = resp.headers.get("content-type", "")
-            if resp.status == 200 and "json" in ct:
-                url = resp.url
-                if any(k in url for k in ("search", "listings", "homes", "properties", "units", "rental", "graphql")):
-                    data = resp.json()
-                    captured.append((url, data))
+            if resp.status == 200 and "json" in ct and "graphql" in resp.url:
+                captured.append((resp.url, resp.json()))
         except Exception:
             pass
-
-    import json as _json
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -51,48 +120,33 @@ def scrape() -> list[Listing]:
         page.on("request", on_request)
         page.on("response", on_response)
         try:
-            page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
-            for sel in ["button.cky-btn-accept", "button[data-cky-tag='accept-button']",
-                        "button[aria-label='Accept All']", "button:has-text('Accept All')"]:
+            page.goto(CITY_PAGE_URL, wait_until="networkidle", timeout=30000)
+            for sel in ["button.cky-btn-accept", "button[aria-label='Accept All']",
+                        "button:has-text('Accept All')"]:
                 try:
-                    page.click(sel, timeout=2000); page.wait_for_timeout(2000); break
+                    page.click(sel, timeout=2000); break
                 except Exception: pass
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(4000)
 
-            # Extract SSR data embedded in page
-            next_data_str = page.evaluate("""
-                () => {
-                    const el = document.getElementById('__NEXT_DATA__');
-                    return el ? el.textContent : null;
-                }
+            # Log all window state keys to find where listings live
+            win_keys = page.evaluate("""
+                () => Object.keys(window).filter(k =>
+                    k.includes('STATE') || k.includes('DATA') || k.includes('QUERY') ||
+                    k.includes('REDUX') || k.includes('STORE') || k.includes('listing') ||
+                    k.includes('search') || k.includes('home'))
             """)
-            if next_data_str:
-                try:
-                    next_data = _json.loads(next_data_str)
-                    page_props = next_data.get("props", {}).get("pageProps", {})
-                    log.info("Spotahome __NEXT_DATA__ pageProps keys: %s", list(page_props.keys())[:15])
-                    captured.append(("__NEXT_DATA__", next_data))
-                except Exception as exc:
-                    log.warning("Spotahome __NEXT_DATA__ parse error: %s", exc)
-            else:
-                log.info("Spotahome: no __NEXT_DATA__ found")
+            log.info("Spotahome window keys: %s", win_keys)
+            log.info("Spotahome GQL queries sent: %s", gql_queries)
 
         except Exception as exc:
-            log.error("Spotahome page error: %s", exc)
+            log.error("Spotahome Playwright error: %s", exc)
         finally:
             browser.close()
 
-    log.info("Spotahome GraphQL queries sent: %s", gql_queries[:6])
-    log.info("Spotahome captured %d JSON responses: %s",
-             len(captured), [c[0][:80] for c in captured])
-    for url, data in captured:
-        log.info("Spotahome response from %s: %s", url, _json.dumps(data)[:500])
-
     listings = []
     for url, data in captured:
-        items = _extract_items(data)
-        for item in items:
+        for item in _extract_items(data):
             l = _parse_item(item)
             if l: listings.append(l)
 
@@ -100,10 +154,7 @@ def scrape() -> list[Listing]:
     for l in listings:
         if l.external_id not in seen:
             seen.add(l.external_id); unique.append(l)
-
-    filtered = [l for l in unique if l.price_eur and l.price_eur <= 1000]
-    log.info("Spotahome: %d listings", len(filtered))
-    return filtered
+    return unique
 
 
 def _extract_items(data, depth=0) -> list:
@@ -121,16 +172,20 @@ def _extract_items(data, depth=0) -> list:
 def _parse_item(item: dict) -> "Listing | None":
     try:
         price_info = item.get("price") or item.get("priceInfo") or item.get("pricing") or {}
-        price = int(price_info.get("amount") or price_info.get("value") or price_info.get("price") or 0) if isinstance(price_info, dict) else int(price_info or 0)
+        price = (
+            int(price_info.get("amount") or price_info.get("value") or price_info.get("price") or 0)
+            if isinstance(price_info, dict) else int(price_info or 0)
+        )
         if price <= 0 or price > 1100: return None
 
         uid = str(item.get("id") or item.get("homeId") or item.get("slug") or "")
         slug = item.get("slug") or uid
         url = f"https://www.spotahome.com/en/flat-and-house-for-rent/{slug}" if slug else ""
         location = item.get("location") or {}
-        neighborhood = (item.get("neighborhood") or item.get("area") or item.get("zone")
-                        or (location.get("neighborhood") if isinstance(location, dict) else None) or "Madrid")
-
+        neighborhood = (
+            item.get("neighborhood") or item.get("area") or item.get("zone")
+            or (location.get("neighborhood") if isinstance(location, dict) else None) or "Madrid"
+        )
         images = []
         for img in item.get("images") or item.get("photos") or item.get("media") or []:
             src = (img.get("url") or img.get("src") or "") if isinstance(img, dict) else img

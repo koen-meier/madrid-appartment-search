@@ -4,6 +4,7 @@ HousingAnywhere — intercepts internal API JSON responses made during page load
 import json
 import logging
 import re
+import httpx
 from .base import Listing
 
 log = logging.getLogger(__name__)
@@ -11,6 +12,49 @@ SEARCH_URL = "https://housinganywhere.com/s/Madrid--Spain/furnished-apartments"
 
 
 def scrape() -> list[Listing]:
+    listings = _try_api_direct()
+    if listings:
+        return listings
+    return _try_playwright()
+
+
+def _try_api_direct() -> list[Listing]:
+    """Try known HousingAnywhere API endpoints directly with httpx."""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "application/json",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://housinganywhere.com/",
+    }
+    endpoints = [
+        "https://housinganywhere.com/api/v2/rooms?cityCanonical=Madrid--Spain&maxPrice=1000&furnishing=true&limit=50",
+        "https://housinganywhere.com/api/v2/listings?cityCanonical=Madrid--Spain&maxPrice=1000&furnished=true&limit=50",
+        "https://housinganywhere.com/api/search?city=Madrid--Spain&maxPrice=1000&furnished=true",
+        "https://housinganywhere.com/api/v3/search?cityCanonical=Madrid--Spain&maxPrice=1000",
+    ]
+    try:
+        with httpx.Client(headers=headers, timeout=20, follow_redirects=True) as client:
+            for url in endpoints:
+                try:
+                    r = client.get(url)
+                    log.info("HA API %s: status=%d body=%s", url[:80], r.status_code, r.text[:200])
+                    if r.status_code == 200:
+                        data = r.json()
+                        items = _extract_items(data)
+                        if items:
+                            log.info("HA API found %d items at %s", len(items), url[:80])
+                            return [l for item in items if (l := _parse_item(item))]
+                except Exception as e:
+                    log.info("HA API %s error: %s", url[:60], e)
+    except Exception as exc:
+        log.error("HA direct API error: %s", exc)
+    return []
+
+
+def _try_playwright() -> list[Listing]:
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -122,14 +166,13 @@ def scrape() -> list[Listing]:
             if l:
                 listings.append(l)
 
-    # Deduplicate
     seen, unique = set(), []
     for l in listings:
         if l.external_id not in seen:
             seen.add(l.external_id); unique.append(l)
 
     filtered = [l for l in unique if l.price_eur and l.price_eur <= 1000]
-    log.info("HousingAnywhere: %d listings", len(filtered))
+    log.info("HousingAnywhere Playwright: %d listings", len(filtered))
     return filtered
 
 
