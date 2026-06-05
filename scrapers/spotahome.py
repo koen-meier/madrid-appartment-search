@@ -31,6 +31,22 @@ def scrape() -> list[Listing]:
         try:
             page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
 
+            # Dismiss cookie banner (CookieYes)
+            for selector in ["button.cky-btn-accept", "button[aria-label='Accept All']",
+                              "button:has-text('Accept All')", "button:has-text('Aceptar')"]:
+                try:
+                    page.click(selector, timeout=3000)
+                    page.wait_for_timeout(2000)
+                    break
+                except Exception:
+                    pass
+
+            # Wait for listing cards
+            try:
+                page.wait_for_selector("[class*='home-card'], [class*='HomeCard'], [class*='listing']", timeout=8000)
+            except Exception:
+                pass
+
             next_data = page.evaluate("""
                 () => {
                     const el = document.getElementById('__NEXT_DATA__');
@@ -53,21 +69,27 @@ def scrape() -> list[Listing]:
 
                 items_json = page.evaluate("""
                     () => {
-                        const cards = document.querySelectorAll('[class*="home-card"], [class*="HomeCard"], [data-testid*="home"]');
-                        return Array.from(cards).map(card => {
+                        const selectors = ['[class*="home-card"]','[class*="HomeCard"]','[class*="HomesCard"]',
+                                           '[data-testid*="home"]','[class*="listing-card"]','article'];
+                        let cards = [];
+                        for (const sel of selectors) {
+                            const found = document.querySelectorAll(sel);
+                            if (found.length > 1) { cards = Array.from(found); break; }
+                        }
+                        return cards.slice(0,60).map(card => {
                             const link = card.querySelector('a[href]');
-                            const price = card.querySelector('[class*="price"], [class*="Price"]');
-                            const title = card.querySelector('h2, h3, [class*="title"]');
-                            const loc = card.querySelector('[class*="zone"], [class*="area"], [class*="location"]');
+                            const price = card.querySelector('[class*="price"],[class*="Price"],[class*="amount"]');
+                            const title = card.querySelector('h2,h3,h4,[class*="title"],[class*="Title"]');
+                            const loc = card.querySelector('[class*="zone"],[class*="area"],[class*="location"],[class*="city"]');
                             const img = card.querySelector('img');
                             return {
                                 url: link ? link.href : '',
                                 priceText: price ? price.innerText : '',
                                 title: title ? title.innerText : '',
                                 neighborhood: loc ? loc.innerText : 'Madrid',
-                                img: img ? (img.src || img.dataset.src || '') : '',
+                                img: img ? (img.src || img.getAttribute('data-src') || '') : '',
                             };
-                        });
+                        }).filter(x => x.url && x.priceText);
                     }
                 """)
                 listings = [l for item in (items_json or []) if (l := _parse_dom_item(item))]

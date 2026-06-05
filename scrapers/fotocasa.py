@@ -34,9 +34,20 @@ def scrape() -> list[Listing]:
         try:
             page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
 
-            # Accept cookie banner if present
+            # Accept cookie banner
+            for selector in ["#didomi-notice-agree-button", "button:has-text('Aceptar todo')",
+                              "button:has-text('Aceptar')", "button:has-text('Accept all')",
+                              "[data-testid='accept-button']"]:
+                try:
+                    page.click(selector, timeout=3000)
+                    page.wait_for_timeout(2000)
+                    break
+                except Exception:
+                    pass
+
+            # Wait for listing cards
             try:
-                page.click("button:has-text('Aceptar'), button:has-text('Accept')", timeout=3000)
+                page.wait_for_selector("[class*='re-Card'], article[class*='card']", timeout=8000)
             except Exception:
                 pass
 

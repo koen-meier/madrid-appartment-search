@@ -32,6 +32,22 @@ def scrape() -> list[Listing]:
         try:
             page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
 
+            # Dismiss cookie banner
+            for selector in ["button[data-testid='accept-all']", "button:has-text('Accept all')",
+                              "button:has-text('Accept All')", "button:has-text('Acepto')", "#onetrust-accept-btn-handler"]:
+                try:
+                    page.click(selector, timeout=2000)
+                    page.wait_for_timeout(1000)
+                    break
+                except Exception:
+                    pass
+
+            # Wait for listing cards to appear
+            try:
+                page.wait_for_selector("[class*='UnitCard'], [class*='ListingCard'], [class*='PropertyCard'], [data-testid*='card']", timeout=8000)
+            except Exception:
+                pass
+
             # Extract __NEXT_DATA__
             next_data = page.evaluate("""
                 () => {
@@ -54,24 +70,37 @@ def scrape() -> list[Listing]:
                 log.info("HousingAnywhere page title: %s", title)
                 log.info("HousingAnywhere HTML sample: %s", sample)
 
-                # Fallback: extract from visible DOM
+                # Fallback: extract from visible DOM — use broad selectors
                 items_json = page.evaluate("""
                     () => {
-                        const cards = document.querySelectorAll('[data-qa="property-card"], [class*="ListingCard"]');
-                        return Array.from(cards).map(card => {
-                            const link = card.querySelector('a[href]');
-                            const price = card.querySelector('[class*="price"], [data-qa*="price"]');
-                            const title = card.querySelector('h2, h3, [class*="title"]');
-                            const loc = card.querySelector('[class*="location"], [class*="area"]');
+                        // Try multiple card selector patterns
+                        const selectors = [
+                            '[class*="UnitCard"]', '[class*="unit-card"]',
+                            '[class*="ListingCard"]', '[class*="listing-card"]',
+                            '[class*="PropertyCard"]', '[class*="property-card"]',
+                            '[data-testid*="card"]', '[data-testid*="listing"]',
+                            'article', 'li[class*="result"]'
+                        ];
+                        let cards = [];
+                        for (const sel of selectors) {
+                            const found = document.querySelectorAll(sel);
+                            if (found.length > 2) { cards = Array.from(found); break; }
+                        }
+                        return cards.slice(0, 60).map(card => {
+                            const links = card.querySelectorAll('a[href*="/rooms/"], a[href*="/listing/"], a[href*="/apartment/"], a[href*="housinganywhere.com"]');
+                            const link = links[0] || card.querySelector('a[href]');
+                            const priceEl = card.querySelector('[class*="price"], [class*="Price"], [class*="amount"]');
+                            const titleEl = card.querySelector('h2, h3, h4, [class*="title"], [class*="Title"]');
+                            const locEl = card.querySelector('[class*="location"], [class*="Location"], [class*="area"], [class*="city"]');
                             const img = card.querySelector('img');
                             return {
                                 url: link ? link.href : '',
-                                priceText: price ? price.innerText : '',
-                                title: title ? title.innerText : '',
-                                neighborhood: loc ? loc.innerText : 'Madrid',
-                                img: img ? (img.src || img.dataset.src || '') : '',
+                                priceText: priceEl ? priceEl.innerText : '',
+                                title: titleEl ? titleEl.innerText : '',
+                                neighborhood: locEl ? locEl.innerText : 'Madrid',
+                                img: img ? (img.src || img.getAttribute('data-src') || '') : '',
                             };
-                        });
+                        }).filter(x => x.url && x.priceText);
                     }
                 """)
                 listings = [l for item in (items_json or []) if (l := _parse_dom_item(item))]

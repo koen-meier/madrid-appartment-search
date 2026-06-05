@@ -43,12 +43,11 @@ def upsert_listing(listing: Listing) -> Optional[str]:
         "lat": listing.lat,
         "lng": listing.lng,
         "raw_data": listing.raw_data,
-        "last_seen_at": "now()",
     }
     try:
         resp = httpx.post(
             _url("listings"),
-            headers={**_HEADERS, "Prefer": "resolution=merge-duplicates,return=representation"},
+            headers={**_HEADERS, "Prefer": "return=representation,resolution=merge-duplicates"},
             json=payload,
             timeout=10,
         )
