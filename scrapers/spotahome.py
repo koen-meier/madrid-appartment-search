@@ -28,7 +28,7 @@ _HEADERS = {
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    # Do NOT set Accept-Encoding — let httpx handle decompression automatically
 }
 
 
@@ -44,6 +44,8 @@ def scrape() -> list[Listing]:
                     break
                 page_listings = _parse_page(resp.text)
                 log.info("Spotahome page %d: %d listings parsed", page, len(page_listings))
+                if page == 1 and not page_listings:
+                    log.info("Spotahome page 1 body start: %s", resp.text[:400])
                 listings.extend(page_listings)
                 if not page_listings:
                     break
