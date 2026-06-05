@@ -23,7 +23,7 @@ def scrape() -> list[Listing]:
             ct = resp.headers.get("content-type", "")
             if resp.status == 200 and "json" in ct:
                 url = resp.url
-                if any(k in url for k in ("search", "listings", "units", "homes", "properties", "rental")):
+                if "housinganywhere" in url or "imgix" not in url:
                     data = resp.json()
                     captured.append((url, data))
         except Exception:
@@ -54,6 +54,9 @@ def scrape() -> list[Listing]:
 
     log.info("HousingAnywhere captured %d JSON responses: %s",
              len(captured), [c[0][:80] for c in captured])
+    for url, data in captured:
+        import json as _json
+        log.info("HA response from %s: %s", url, _json.dumps(data)[:400])
 
     listings = []
     for url, data in captured:

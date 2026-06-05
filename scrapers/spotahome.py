@@ -50,6 +50,9 @@ def scrape() -> list[Listing]:
 
     log.info("Spotahome captured %d JSON responses: %s",
              len(captured), [c[0][:80] for c in captured])
+    for url, data in captured:
+        import json as _json
+        log.info("Spotahome response from %s: %s", url, _json.dumps(data)[:500])
 
     listings = []
     for url, data in captured:
