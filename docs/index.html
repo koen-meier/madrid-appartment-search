@@ -364,25 +364,26 @@ function buildCard(l) {
 }
 
 async function rate(id, rating, btn) {
-  if (myVotes[id]) return; // already voted
-
-  // Optimistic UI
-  const card = btn.closest(".card");
-  card.querySelectorAll(".btn-good,.btn-maybe,.btn-bad").forEach(b => {
-    b.classList.remove("active-good","active-maybe","active-bad");
-  });
-  btn.classList.add(`active-${rating}`);
-  card.classList.toggle("rated-bad", rating === "bad");
-  myVotes[id] = rating;
+  const prev = myVotes[id];
   if (!countsMap[id]) countsMap[id] = { good: 0, maybe: 0, bad: 0 };
-  countsMap[id][rating]++;
-  render();
 
-  // Save to DB (upsert so re-votes are ignored at DB level too)
-  await sb.from("ratings").upsert(
-    { listing_id: id, rating, voter_id: VOTER_ID },
-    { onConflict: "listing_id,voter_id" }
-  );
+  if (prev === rating) {
+    // Toggle off — remove vote
+    delete myVotes[id];
+    countsMap[id][rating] = Math.max(0, countsMap[id][rating] - 1);
+    render();
+    await sb.from("ratings").delete().eq("listing_id", id).eq("voter_id", VOTER_ID);
+  } else {
+    // New vote (or switch)
+    if (prev) countsMap[id][prev] = Math.max(0, countsMap[id][prev] - 1);
+    myVotes[id] = rating;
+    countsMap[id][rating]++;
+    render();
+    await sb.from("ratings").upsert(
+      { listing_id: id, rating, voter_id: VOTER_ID },
+      { onConflict: "listing_id,voter_id" }
+    );
+  }
 }
 
 function esc(s) {
