@@ -112,6 +112,13 @@
       font-size: 10px; font-weight: 700; background: #fbbf24; color: #78350f;
       padding: 2px 6px; border-radius: 99px; margin-left: 4px;
     }
+
+    .location-tags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+    .location-tag {
+      font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 99px;
+    }
+    .tag-plaza { background: #fce7f3; color: #be185d; }
+    .tag-ie    { background: #dbeafe; color: #1d4ed8; }
   </style>
 </head>
 <body>
@@ -161,6 +168,24 @@
 </main>
 
 <script>
+// ── Location tags ───────────────────────────────────────────────────────────
+const PLAZA_ESPANA = { lat: 40.4237, lng: -3.7124 };
+const IE_TOWER     = { lat: 40.4680, lng: -3.6745 };
+const WALK_SPEED_M_PER_MIN = 80; // ~4.8 km/h
+const WALK_FACTOR = 1.3;         // straight-line to actual walking distance
+
+function haversineM(lat1, lng1, lat2, lng2) {
+  const R = 6371000;
+  const d2r = Math.PI / 180;
+  const dLat = (lat2 - lat1) * d2r, dLng = (lng2 - lng1) * d2r;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*d2r)*Math.cos(lat2*d2r)*Math.sin(dLng/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+function walkingMins(lat, lng, ref) {
+  return (haversineM(lat, lng, ref.lat, ref.lng) * WALK_FACTOR) / WALK_SPEED_M_PER_MIN;
+}
+
 // ── Config ─────────────────────────────────────────────────────────────────
 const SUPABASE_URL = "https://dunuilfxwivchtictnir.supabase.co";
 const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImR1bnVpbGZ4d2l2Y2h0aWN0bmlyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA1MzI0NjgsImV4cCI6MjA5NjEwODQ2OH0.d5s3snjBVqetDkYNT6m1j_Q90-x5DukyK-fHQrppx50";
@@ -286,6 +311,16 @@ function buildCard(l) {
   const dateStr = new Date(l.first_seen_at).toLocaleDateString("en-GB", { day: "numeric", month: "short" });
   const isNew = Date.now() - new Date(l.first_seen_at) < 24 * 60 * 60 * 1000;
 
+  let locationTagsHtml = "";
+  if (l.lat && l.lng) {
+    const minsPlaza = walkingMins(l.lat, l.lng, PLAZA_ESPANA);
+    const minsIE    = walkingMins(l.lat, l.lng, IE_TOWER);
+    const tags = [];
+    if (minsPlaza <= 25) tags.push(`<span class="location-tag tag-plaza">🌸 ${Math.round(minsPlaza)} min from Plaza de España</span>`);
+    if (minsIE    <= 15) tags.push(`<span class="location-tag tag-ie">🏢 ${Math.round(minsIE)} min from IE Tower</span>`);
+    if (tags.length) locationTagsHtml = `<div class="location-tags">${tags.join("")}</div>`;
+  }
+
   card.innerHTML = `
     ${imgHtml}
     <div class="card-body">
@@ -295,6 +330,7 @@ function buildCard(l) {
       </div>
       <div class="card-title">${esc(l.title || "Apartment")}</div>
       <div class="card-meta">${esc(l.neighborhood || "")}${area} · seen ${dateStr}</div>
+      ${locationTagsHtml}
     </div>
     ${r?.comment ? `<div class="rating-note" title="${esc(r.comment)}">💬 ${esc(r.comment)}</div>` : ""}
     <div class="card-actions">
