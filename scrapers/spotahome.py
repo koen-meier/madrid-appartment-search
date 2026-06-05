@@ -119,25 +119,53 @@ def _try_playwright() -> list[Listing]:
         page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         page.on("request", on_request)
         page.on("response", on_response)
+        # Start on base city page (no dates) to get the search form
+        BASE_URL = "https://www.spotahome.com/s/madrid/for-rent:apartments"
         try:
-            page.goto(CITY_PAGE_URL, wait_until="networkidle", timeout=30000)
+            page.goto(BASE_URL, wait_until="networkidle", timeout=30000)
             for sel in ["button.cky-btn-accept", "button[aria-label='Accept All']",
-                        "button:has-text('Accept All')"]:
+                        "button:has-text('Accept All')", "#accept-cookies"]:
                 try:
-                    page.click(sel, timeout=2000); break
+                    page.click(sel, timeout=2000); page.wait_for_timeout(1000); break
                 except Exception: pass
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(4000)
 
-            # Log all window state keys to find where listings live
-            win_keys = page.evaluate("""
-                () => Object.keys(window).filter(k =>
-                    k.includes('STATE') || k.includes('DATA') || k.includes('QUERY') ||
-                    k.includes('REDUX') || k.includes('STORE') || k.includes('listing') ||
-                    k.includes('search') || k.includes('home'))
+            # Log page body to understand structure
+            body = page.evaluate("() => document.body.innerText.slice(0, 600)")
+            log.info("Spotahome page body: %s", body)
+
+            # Find and log all input fields
+            inputs = page.evaluate("""
+                () => Array.from(document.querySelectorAll('input')).map(i => ({
+                    name: i.name, type: i.type, placeholder: i.placeholder, id: i.id,
+                    className: i.className.slice(0, 50)
+                }))
             """)
-            log.info("Spotahome window keys: %s", win_keys)
-            log.info("Spotahome GQL queries sent: %s", gql_queries)
+            log.info("Spotahome form inputs: %s", inputs[:10])
+
+            # Try to fill date fields and submit search
+            for sel in ["input[name='checkIn']", "input[name='check_in']",
+                        "input[placeholder*='Check']", "input[type='date']"]:
+                try:
+                    page.fill(sel, "2026-08-01", timeout=2000)
+                    log.info("Spotahome: filled check-in at %s", sel); break
+                except Exception: pass
+
+            for sel in ["input[name='checkOut']", "input[name='check_out']"]:
+                try:
+                    page.fill(sel, "2026-12-31", timeout=2000)
+                    log.info("Spotahome: filled check-out at %s", sel); break
+                except Exception: pass
+
+            for sel in ["button[type='submit']", "button:has-text('Search')",
+                        "button:has-text('Buscar')", "[class*='search-button']", "[class*='SearchButton']"]:
+                try:
+                    page.click(sel, timeout=2000)
+                    page.wait_for_timeout(5000)
+                    log.info("Spotahome: clicked search at %s", sel); break
+                except Exception: pass
+
+            page.wait_for_timeout(3000)
+            log.info("Spotahome GQL requests: %s", gql_queries[:5])
 
         except Exception as exc:
             log.error("Spotahome Playwright error: %s", exc)

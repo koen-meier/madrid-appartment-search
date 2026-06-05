@@ -61,6 +61,15 @@ def _try_playwright() -> list[Listing]:
         log.error("playwright not installed"); return []
 
     captured = []
+    all_urls = []
+
+    def on_request(req):
+        try:
+            url = req.url
+            if "housinganywhere.com" in url and "cdn" not in url and "cookie" not in url.lower():
+                all_urls.append(f"{req.method} {url[:120]}")
+        except Exception:
+            pass
 
     def on_response(resp):
         try:
@@ -85,33 +94,26 @@ def _try_playwright() -> list[Listing]:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ))
         page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        page.on("request", on_request)
         page.on("response", on_response)
         try:
             page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
-            # Dismiss cookies then wait for more API calls
+            # Dismiss cookies
             for sel in ["button.cky-btn-accept", "button[aria-label='Accept All']",
                         "#onetrust-accept-btn-handler", "button:has-text('Accept All')"]:
                 try:
-                    page.click(sel, timeout=2000); page.wait_for_timeout(2000); break
+                    page.click(sel, timeout=2000); page.wait_for_timeout(3000); break
                 except Exception: pass
             # Scroll to trigger lazy loading
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(5000)
 
-            # Try waiting for listing cards to appear
-            for sel in ["[data-cy='listing-card']", "[class*='ListingCard']",
-                        "[class*='listing-card']", "article[class*='card']", "[data-testid*='listing']"]:
-                try:
-                    page.wait_for_selector(sel, timeout=5000); break
-                except Exception: pass
+            # Log ALL housinganywhere.com requests to find the listings API
+            log.info("HA all requests: %s", all_urls)
 
-            # Log page title and first 500 chars to diagnose
+            # Log page content
             log.info("HA page title: %s", page.title())
-            log.info("HA body: %s", page.evaluate("() => document.body.innerText.slice(0, 500)"))
-
-            # Try to intercept all JSON URLs for listing data
-            for url, data in captured:
-                log.info("HA all response URL: %s", url[:100])
+            log.info("HA body: %s", page.evaluate("() => document.body.innerText.slice(0, 800)"))
 
             # Extract SSR data
             next_data_str = page.evaluate("""
