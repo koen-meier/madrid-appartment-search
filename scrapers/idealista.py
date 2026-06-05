@@ -34,11 +34,15 @@ def scrape() -> list[Listing]:
 
     listings = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         page = browser.new_page(user_agent=(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ))
+        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         page.on("response", on_response)
         try:
             page.goto(SEARCH_URLS[0], wait_until="networkidle", timeout=30000)
@@ -51,6 +55,12 @@ def scrape() -> list[Listing]:
                 except Exception: pass
 
             page.wait_for_timeout(2000)
+
+            # Log page title and body excerpt to diagnose bot detection
+            title = page.title()
+            body_text = page.evaluate("() => document.body.innerText.slice(0, 300)")
+            log.info("Idealista page title: %s", title)
+            log.info("Idealista body start: %s", body_text)
 
             # Parse listing cards from the DOM
             items_json = page.evaluate("""

@@ -23,7 +23,10 @@ def scrape() -> list[Listing]:
 
     listings = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         page = browser.new_page(
             user_agent=(
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -31,8 +34,13 @@ def scrape() -> list[Listing]:
                 "Chrome/124.0.0.0 Safari/537.36"
             )
         )
+        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         try:
             page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
+
+            # Log page title to diagnose bot detection
+            log.info("Fotocasa page title: %s", page.title())
+            log.info("Fotocasa body start: %s", page.evaluate("() => document.body.innerText.slice(0, 200)"))
 
             # Accept cookie banner
             for selector in ["#didomi-notice-agree-button", "button:has-text('Aceptar todo')",

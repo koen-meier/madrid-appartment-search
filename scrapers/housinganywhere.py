@@ -29,12 +29,18 @@ def scrape() -> list[Listing]:
         except Exception:
             pass
 
+    import json as _json
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         page = browser.new_page(user_agent=(
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ))
+        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
         page.on("response", on_response)
         try:
             page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
@@ -42,11 +48,47 @@ def scrape() -> list[Listing]:
             for sel in ["button.cky-btn-accept", "button[aria-label='Accept All']",
                         "#onetrust-accept-btn-handler", "button:has-text('Accept All')"]:
                 try:
-                    page.click(sel, timeout=2000); page.wait_for_timeout(3000); break
+                    page.click(sel, timeout=2000); page.wait_for_timeout(2000); break
                 except Exception: pass
             # Scroll to trigger lazy loading
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(3000)
+
+            # Extract SSR data
+            next_data_str = page.evaluate("""
+                () => {
+                    const el = document.getElementById('__NEXT_DATA__');
+                    return el ? el.textContent : null;
+                }
+            """)
+            if next_data_str:
+                try:
+                    next_data = _json.loads(next_data_str)
+                    page_props = next_data.get("props", {}).get("pageProps", {})
+                    log.info("HA __NEXT_DATA__ pageProps keys: %s", list(page_props.keys())[:15])
+                    captured.append(("__NEXT_DATA__", next_data))
+                except Exception as exc:
+                    log.warning("HA __NEXT_DATA__ parse error: %s", exc)
+            else:
+                # Try window.__INITIAL_STATE__ or similar
+                alt = page.evaluate("""
+                    () => {
+                        for (const k of ['__INITIAL_STATE__', '__APP_STATE__', '__REDUX_STATE__']) {
+                            if (window[k]) return JSON.stringify(window[k]);
+                        }
+                        return null;
+                    }
+                """)
+                if alt:
+                    try:
+                        alt_data = _json.loads(alt)
+                        log.info("HA window state keys: %s", list(alt_data.keys())[:10])
+                        captured.append(("__WINDOW_STATE__", alt_data))
+                    except Exception as exc:
+                        log.warning("HA window state parse error: %s", exc)
+                else:
+                    log.info("HA: no embedded SSR data found")
+
         except Exception as exc:
             log.error("HousingAnywhere page error: %s", exc)
         finally:
@@ -55,7 +97,6 @@ def scrape() -> list[Listing]:
     log.info("HousingAnywhere captured %d JSON responses: %s",
              len(captured), [c[0][:80] for c in captured])
     for url, data in captured:
-        import json as _json
         log.info("HA response from %s: %s", url, _json.dumps(data)[:400])
 
     listings = []
