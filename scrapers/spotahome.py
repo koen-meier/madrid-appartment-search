@@ -5,7 +5,7 @@ import logging
 from .base import Listing
 
 log = logging.getLogger(__name__)
-SEARCH_URL = "https://www.spotahome.com/s/madrid/for-rent:apartments"
+SEARCH_URL = "https://www.spotahome.com/s/madrid/for-rent:apartments?checkIn=2026-08-01&checkOut=2026-12-31&maxPrice=100000"
 
 
 def scrape() -> list[Listing]:
@@ -15,6 +15,15 @@ def scrape() -> list[Listing]:
         log.error("playwright not installed"); return []
 
     captured = []
+    gql_queries = []
+
+    def on_request(req):
+        try:
+            if "graphql" in req.url and req.method == "POST":
+                body = req.post_data or ""
+                gql_queries.append(body[:300])
+        except Exception:
+            pass
 
     def on_response(resp):
         try:
@@ -39,6 +48,7 @@ def scrape() -> list[Listing]:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ))
         page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        page.on("request", on_request)
         page.on("response", on_response)
         try:
             page.goto(SEARCH_URL, wait_until="networkidle", timeout=30000)
@@ -73,6 +83,7 @@ def scrape() -> list[Listing]:
         finally:
             browser.close()
 
+    log.info("Spotahome GraphQL queries sent: %s", gql_queries[:6])
     log.info("Spotahome captured %d JSON responses: %s",
              len(captured), [c[0][:80] for c in captured])
     for url, data in captured:

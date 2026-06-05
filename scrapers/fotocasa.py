@@ -23,15 +23,10 @@ def scrape() -> list[Listing]:
 
     listings = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
+        browser = p.firefox.launch(headless=True)
         page = browser.new_page(
             user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
+                "Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0"
             )
         )
         page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")

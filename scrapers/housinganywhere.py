@@ -54,6 +54,21 @@ def scrape() -> list[Listing]:
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(3000)
 
+            # Try waiting for listing cards to appear
+            for sel in ["[data-cy='listing-card']", "[class*='ListingCard']",
+                        "[class*='listing-card']", "article[class*='card']", "[data-testid*='listing']"]:
+                try:
+                    page.wait_for_selector(sel, timeout=5000); break
+                except Exception: pass
+
+            # Log page title and first 500 chars to diagnose
+            log.info("HA page title: %s", page.title())
+            log.info("HA body: %s", page.evaluate("() => document.body.innerText.slice(0, 500)"))
+
+            # Try to intercept all JSON URLs for listing data
+            for url, data in captured:
+                log.info("HA all response URL: %s", url[:100])
+
             # Extract SSR data
             next_data_str = page.evaluate("""
                 () => {
