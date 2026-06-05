@@ -48,6 +48,7 @@ def upsert_listing(listing: Listing) -> Optional[str]:
         resp = httpx.post(
             _url("listings"),
             headers={**_HEADERS, "Prefer": "return=representation,resolution=merge-duplicates"},
+            params={"on_conflict": "source,external_id"},
             json=payload,
             timeout=10,
         )
