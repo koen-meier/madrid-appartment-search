@@ -17,7 +17,7 @@ Sources: HousingAnywhere ✅, Spotahome ✅, Idealista ⚠️, Fotocasa ❌ drop
 - `.env` file at project root has all keys
 - GitHub Actions secrets set: SUPABASE_URL, SUPABASE_SERVICE_KEY, APIFY_TOKEN
 - Supabase anon key is hardcoded in `dashboard/index.html`
-- GitHub token: `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` (repo + workflow scopes)
+- GitHub token: `YOUR_GITHUB_TOKEN` (repo + workflow scopes)
 
 ## Current scraper status
 | Source | Status | Notes |
@@ -91,7 +91,7 @@ Authorization: Bearer $APIFY_TOKEN
 
 ## To push and trigger a run
 ```bash
-TOKEN=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
+TOKEN=YOUR_GITHUB_TOKEN
 cd /Users/koenmeier/Developer/projects/madrid-appartment-search
 git add -A && git commit -m "message" && \
 git push https://koen-meier:$TOKEN@github.com/koen-meier/madrid-appartment-search.git main
@@ -102,7 +102,7 @@ curl -X POST -H "Authorization: token $TOKEN" -H "Content-Type: application/json
 
 ## How to get logs from latest run
 ```bash
-TOKEN=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
+TOKEN=YOUR_GITHUB_TOKEN
 RUN_ID=$(curl -s "https://api.github.com/repos/koen-meier/madrid-appartment-search/actions/runs?per_page=1" \
   -H "Authorization: token $TOKEN" | python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['id'])")
 JOB_ID=$(curl -s "https://api.github.com/repos/koen-meier/madrid-appartment-search/actions/runs/$RUN_ID/jobs" \
