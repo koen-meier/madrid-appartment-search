@@ -119,6 +119,8 @@
     }
     .tag-plaza { background: #fce7f3; color: #be185d; }
     .tag-ie    { background: #dbeafe; color: #1d4ed8; }
+
+    .vote-count { font-size: 12px; font-weight: 700; opacity: .85; }
   </style>
 </head>
 <body>
@@ -194,25 +196,36 @@ const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// Persistent anonymous voter ID stored in localStorage
+function getVoterId() {
+  let id = localStorage.getItem("voter_id");
+  if (!id) { id = crypto.randomUUID(); localStorage.setItem("voter_id", id); }
+  return id;
+}
+const VOTER_ID = getVoterId();
+
 let allListings = [];
-let ratingsMap = {};  // listing_id → { rating, comment }
+let countsMap = {};  // listing_id → { good: n, maybe: n, bad: n }
+let myVotes = {};    // listing_id → 'good' | 'maybe' | 'bad'
 
 async function load() {
-  // Fetch all listings
   const { data: listings, error } = await sb
     .from("listings")
     .select("*")
     .order("first_seen_at", { ascending: false });
 
   if (error) { document.getElementById("loading").textContent = "Error: " + error.message; return; }
-
   allListings = listings || [];
 
-  // Fetch all ratings
-  const { data: ratings } = await sb.from("ratings").select("*").order("created_at", { ascending: false });
-  ratingsMap = {};
+  // Fetch all ratings to build counts + my own votes
+  const { data: ratings } = await sb.from("ratings").select("listing_id,rating,voter_id");
+  countsMap = {};
+  myVotes = {};
   for (const r of (ratings || [])) {
-    if (!ratingsMap[r.listing_id]) ratingsMap[r.listing_id] = r;
+    if (!r.rating) continue;
+    if (!countsMap[r.listing_id]) countsMap[r.listing_id] = { good: 0, maybe: 0, bad: 0 };
+    countsMap[r.listing_id][r.rating] = (countsMap[r.listing_id][r.rating] || 0) + 1;
+    if (r.voter_id === VOTER_ID) myVotes[r.listing_id] = r.rating;
   }
 
   populateNeighborhoodFilter();
@@ -249,13 +262,13 @@ function applyFilters() {
     if (neighborhood && l.neighborhood !== neighborhood) return false;
     if (l.price_eur > maxPrice) return false;
 
-    const r = ratingsMap[l.id];
-    if (hideBad && r?.rating === "bad") return false;
+    const myVote = myVotes[l.id];
+    if (hideBad && myVote === "bad") return false;
 
-    if (ratingFilter === "unrated" && r) return false;
-    if (ratingFilter === "good"    && r?.rating !== "good") return false;
-    if (ratingFilter === "maybe"   && r?.rating !== "maybe") return false;
-    if (ratingFilter === "bad"     && r?.rating !== "bad") return false;
+    if (ratingFilter === "unrated" && myVote) return false;
+    if (ratingFilter === "good"    && myVote !== "good") return false;
+    if (ratingFilter === "maybe"   && myVote !== "maybe") return false;
+    if (ratingFilter === "bad"     && myVote !== "bad") return false;
 
     return true;
   });
@@ -272,7 +285,7 @@ function render() {
   const empty = document.getElementById("empty");
 
   // Stats
-  const unrated = allListings.filter(l => !ratingsMap[l.id]).length;
+  const unrated = allListings.filter(l => !myVotes[l.id]).length;
   const newCount = allListings.filter(l => {
     const age = Date.now() - new Date(l.first_seen_at);
     return age < 24 * 60 * 60 * 1000;
@@ -298,9 +311,10 @@ function render() {
 }
 
 function buildCard(l) {
-  const r = ratingsMap[l.id];
+  const myVote = myVotes[l.id];
+  const counts = countsMap[l.id] || { good: 0, maybe: 0, bad: 0 };
   const card = document.createElement("div");
-  card.className = "card" + (r?.rating === "bad" ? " rated-bad" : "");
+  card.className = "card" + (myVote === "bad" ? " rated-bad" : "");
   card.dataset.id = l.id;
 
   const img = l.images?.[0];
@@ -333,22 +347,25 @@ function buildCard(l) {
       <div class="card-meta">${esc(l.neighborhood || "")}${area} · seen ${dateStr}</div>
       ${locationTagsHtml}
     </div>
-    ${r?.comment ? `<div class="rating-note" title="${esc(r.comment)}">💬 ${esc(r.comment)}</div>` : ""}
     <div class="card-actions">
-      <button class="btn btn-good ${r?.rating === 'good' ? 'active-good' : ''}" onclick="rate('${l.id}','good',this)">👍</button>
-      <button class="btn btn-maybe ${r?.rating === 'maybe' ? 'active-maybe' : ''}" onclick="rate('${l.id}','maybe',this)">🤔</button>
-      <button class="btn btn-bad ${r?.rating === 'bad' ? 'active-bad' : ''}" onclick="rate('${l.id}','bad',this)">👎</button>
+      <button class="btn btn-good ${myVote === 'good' ? 'active-good' : ''}" onclick="rate('${l.id}','good',this)">
+        👍${counts.good ? ` <span class="vote-count">${counts.good}</span>` : ''}
+      </button>
+      <button class="btn btn-maybe ${myVote === 'maybe' ? 'active-maybe' : ''}" onclick="rate('${l.id}','maybe',this)">
+        🤔${counts.maybe ? ` <span class="vote-count">${counts.maybe}</span>` : ''}
+      </button>
+      <button class="btn btn-bad ${myVote === 'bad' ? 'active-bad' : ''}" onclick="rate('${l.id}','bad',this)">
+        👎${counts.bad ? ` <span class="vote-count">${counts.bad}</span>` : ''}
+      </button>
       <a class="btn btn-link" href="${esc(l.url)}" target="_blank" rel="noopener">View →</a>
-    </div>
-    <div class="comment-row" id="comment-${l.id}">
-      <input type="text" placeholder="Add a note (optional)…" value="${esc(r?.comment || '')}">
-      <button onclick="saveComment('${l.id}')">Save</button>
     </div>`;
 
   return card;
 }
 
 async function rate(id, rating, btn) {
+  if (myVotes[id]) return; // already voted
+
   // Optimistic UI
   const card = btn.closest(".card");
   card.querySelectorAll(".btn-good,.btn-maybe,.btn-bad").forEach(b => {
@@ -356,27 +373,16 @@ async function rate(id, rating, btn) {
   });
   btn.classList.add(`active-${rating}`);
   card.classList.toggle("rated-bad", rating === "bad");
-
-  // Show comment box
-  const commentRow = document.getElementById(`comment-${id}`);
-  commentRow.classList.add("open");
-
-  // Save to DB
-  const { data } = await sb.from("ratings").insert({ listing_id: id, rating }).select().single();
-  if (data) {
-    ratingsMap[id] = data;
-    render();
-  }
-}
-
-async function saveComment(id) {
-  const row = document.getElementById(`comment-${id}`);
-  const text = row.querySelector("input").value.trim();
-  if (!text) return;
-
-  await sb.from("ratings").insert({ listing_id: id, comment: text });
-  if (ratingsMap[id]) ratingsMap[id].comment = text;
+  myVotes[id] = rating;
+  if (!countsMap[id]) countsMap[id] = { good: 0, maybe: 0, bad: 0 };
+  countsMap[id][rating]++;
   render();
+
+  // Save to DB (upsert so re-votes are ignored at DB level too)
+  await sb.from("ratings").upsert(
+    { listing_id: id, rating, voter_id: VOTER_ID },
+    { onConflict: "listing_id,voter_id" }
+  );
 }
 
 function esc(s) {
