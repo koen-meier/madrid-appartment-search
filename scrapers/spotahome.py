@@ -80,8 +80,8 @@ def scrape() -> list[Listing]:
 
 
 def _extract_coords(html: str):
-    # Coords appear as: "coord",[ref1,ref2],LNG,LAT in the page data
-    m = re.search(r'"coord",\[[^\]]+\],([-0-9.]+),([-0-9.]+)', html)
+    # Coords appear as: \"coord\",[ref1,ref2],LNG,LAT in the page data (quotes are escaped)
+    m = re.search(r'coord[\\\"]+,\[[^\]]+\],([-0-9.]+),([-0-9.]+)', html)
     if m:
         return float(m.group(2)), float(m.group(1))  # lat, lng
     return None, None
